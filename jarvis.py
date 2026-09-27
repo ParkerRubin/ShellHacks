@@ -791,8 +791,9 @@ class Servo:
             cls.calib = "done"; return                                  # .env wins
         try:
             d = json.loads(cls.DIRS_FILE.read_text()); PAN_DIR, TILT_DIR = int(d["pan"]), int(d["tilt"])
-            cls.calib = "done"
-            print(f"Servo directions (from last calibration): pan {PAN_DIR:+d}, tilt {TILT_DIR:+d}. Press K to recalibrate.")
+            cls.lat = cls.lat_measured = float(d.get("latency", CAM_LATENCY)) if not os.getenv("CAM_LATENCY") else CAM_LATENCY
+            cls.calib = "done" if ("latency" in d or os.getenv("CAM_LATENCY")) else None   # older file: re-measure lag once
+            print(f"Servo calibration loaded: pan {PAN_DIR:+d}, camera lag {cls.lat * 1000:.0f} ms. Press K to recalibrate.")
         except Exception:
             print("Servo directions not calibrated yet: I'll nudge the head once when I first see you.")
 
@@ -816,10 +817,12 @@ class Servo:
         if phase == "settle":                                           # stand still briefly, record where you are
             cls.pan, cls.tilt = base
             if now - t0 > 0.3:
-                cls.probe = (axis, "move", now, e, base)
+                cls.probe = (axis, "move", now, e, base); cls.probe_seen = None
                 if axis == "pan": cls.pan = base[0] + 8
                 else: cls.tilt = base[1] + 8
-        elif phase == "move" and now - t0 > 0.55 + CAM_LATENCY:          # glide done and a fresh frame is in
+        elif phase == "move" and cls.probe_seen is None and abs(e - e0) > 0.5 * 8 / CAM_HFOV:
+            cls.probe_seen = now                                        # first frame showing the nudge = camera lag
+        if phase == "move" and now - t0 > 0.9:                          # glide done and fresh frames are in
             d = e - e0
             if not 0.05 < abs(d) < 0.3:                                 # too small: servo didn't turn. too big: you moved
                 cls.probe = None; cls.pan, cls.tilt = base; cls.calib_retry = now + 3
@@ -838,19 +841,54 @@ class Servo:
             else:
                 ok = (d < 0) == (TILT_DIR > 0)                          # model: +tilt shifts you up in the image when TILT_DIR=+1
                 if not ok: TILT_DIR = -TILT_DIR
-            print(f"[calibration] {axis}: image shift {d:+.3f} -> direction {'OK' if ok else 'was backwards, flipped'}")
+            if axis == "pan" and cls.probe_seen and not os.getenv("CAM_LATENCY"):
+                fp = 1.0 / max(10.0, S.fps)                                  # glide needs ~35 ms to show, plus frame timing
+                cls.lat = cls.lat_measured = min(0.45, max(0.03, cls.probe_seen - t0 - 0.035 - 2 * fp))
+            print(f"[calibration] {axis}: image shift {d:+.3f} -> direction {'OK' if ok else 'was backwards, flipped'}, "
+                  f"camera lag {cls.lat * 1000:.0f} ms")
             cls.pan, cls.tilt = base
             if axis == "pan" and SERVO_TILT:
                 cls.probe = ("tilt", "settle", now, None, base)
             else:
                 cls.probe, cls.calib = None, "done"
-                try: cls.DIRS_FILE.write_text(json.dumps({"pan": PAN_DIR, "tilt": TILT_DIR}))
-                except Exception: pass
+                cls.save_calib()
                 set_status(f"Servo calibrated (pan {PAN_DIR:+d}, tilt {TILT_DIR:+d})", 4)
         cls.send()
     calib_retry = 0.0
     calib_fails = 0
     last_seen = (-99.0, 0.0, 90.0)                                     # (time, image offset, world angle) when last seen
+    lat = CAM_LATENCY                                                  # camera lag, measured during calibration
+    probe_seen = None
+    osc = deque(maxlen=150); osc_cool = 0.0                            # recent (time, pan command) for wobble detection
+    lat_measured = CAM_LATENCY
+
+    @classmethod
+    def save_calib(cls):
+        try: cls.DIRS_FILE.write_text(json.dumps({"pan": PAN_DIR, "tilt": TILT_DIR, "latency": round(cls.lat, 3)}))
+        except Exception: pass
+
+    @classmethod
+    def check_wobble(cls, now):
+        """Backup for a wrong lag estimate: if the head keeps swinging back and forth, assume more lag."""
+        cls.osc.append((now, cls.pan))
+        if now < cls.osc_cool: return
+        recent = [p for t, p in cls.osc if now - t < 3.0]
+        if len(recent) < 30: return
+        # count real swings only: a turn only counts once the head has come back at least 3 degrees
+        turns, direction, hi, lo = 0, 0, recent[0], recent[0]
+        for p in recent[1:]:
+            hi, lo = max(hi, p), min(lo, p)
+            if direction >= 0 and hi - p >= 3:              # came back down 3+ degrees from a high point
+                turns += direction > 0; direction, hi, lo = -1, p, p
+            elif direction <= 0 and p - lo >= 3:            # came back up 3+ degrees from a low point
+                turns += direction < 0; direction, hi, lo = 1, p, p
+        if turns >= 5 and max(recent) - min(recent) >= 5:
+            cls.lat = min(0.45, cls.lat_measured + 0.2, cls.lat + 0.05)       # never stray far from what calibration measured
+            cls.osc.clear(); cls.osc_cool = now + 2.0
+            cls.prev_world, cls.vel = None, (0.0, 0.0)
+            print(f"[servo] head was wobbling: assuming {cls.lat * 1000:.0f} ms camera lag now")
+            set_status(f"Steadying the head (lag {cls.lat * 1000:.0f} ms)", 3)
+            cls.save_calib()
     auto = True            # X toggles face/object following on and off
     STEP = float(os.getenv("SERVO_STEP", "5"))                         # degrees per arrow-key press (hold to keep turning)
 
@@ -947,7 +985,7 @@ class Servo:
                 if cls.probe is not None or (now >= cls.calib_retry and still and abs(ex) < 0.3):
                     cls.run_probe(now, ex, ey)
                 return
-            cp, ct = cls._pose_at(now - CAM_LATENCY)
+            cp, ct = cls._pose_at(now - cls.lat)
             wx = cp - PAN_DIR * ex * CAM_HFOV
             wy = ct + TILT_DIR * ey * vfov
             if cls.prev_world is not None and now - cls.prev_t > 0:
@@ -964,6 +1002,7 @@ class Servo:
             if abs(ex) > 0.25: lead_x = max(-10.0, min(10.0, cls.vel[0] * SERVO_LEAD * 2))
             if abs(ex) > 0.03:                                       # small deadband so it doesn't twitch
                 cls.pan = cls.est_pan + gain * (wx - cls.est_pan) + lead_x
+            cls.check_wobble(now)
             if abs(ey) > 0.04:
                 cls.tilt = cls.est_tilt + SERVO_GAIN * (wy - cls.est_tilt) + lead_y
         else:
@@ -1106,7 +1145,7 @@ def head_shift(now):
     From calibration: +1 degree of pan shifts the scene PAN_DIR/CAM_HFOV to the right."""
     if Servo.ser is None or Servo.calib != "done" or not Servo.est_hist: 
         S.prev_head = None; return 0.0
-    p, _ = Servo._pose_at(now - CAM_LATENCY)
+    p, _ = Servo._pose_at(now - Servo.lat)
     prev = S.prev_head; S.prev_head = p
     return 0.0 if prev is None else PAN_DIR * (p - prev) / CAM_HFOV
 
