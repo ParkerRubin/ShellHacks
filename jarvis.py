@@ -41,6 +41,8 @@ PAN_DIR       = -1 if os.getenv("SERVO_INVERT_PAN", "0") == "1" else 1    # flip
 TILT_DIR      = -1 if os.getenv("SERVO_INVERT_TILT", "0") == "1" else 1
 GEMINI_FALLBACKS = [m.strip() for m in os.getenv("GEMINI_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash").split(",") if m.strip()]
 AUTO_BUDGET   = int(os.getenv("AUTO_BUDGET", "25"))            # max background Gemini calls per run (free tier is ~20/day/model)
+FACE_MIN      = float(os.getenv("FACE_MIN", "0.10"))          # ignore faces smaller than this share of frame height (background people)
+LOCK_HOLD     = float(os.getenv("LOCK_HOLD", "1.5"))          # seconds to keep the lock on you while your face is briefly hidden
 GESTURES      = os.getenv("GESTURES", "1") == "1"              # hand gestures (local models, no API calls)
 AUTONOMY      = os.getenv("AUTONOMY", "aware")                # off, aware (silent awareness), proactive (speaks up on its own)
 GLANCE_EVERY  = float(os.getenv("GLANCE_EVERY", "90"))        # min seconds between background scene checks (skipped if nothing changed)
@@ -89,6 +91,8 @@ class State:
     last_user_t = 0.0     # last time the user spoke
     disp_map = (0, 0, 1, 1); buttons = []; bar_top = 10000; drag = None; rdrag = None
     face_target = None    # smoothed box of the person being tracked
+    candidate = None      # (box, frames seen) while deciding who to lock onto
+    reacquire = None      # (box, frames seen) while confirming you're back after being hidden
     hands = []            # [(gesture, box_norm, landmarks_norm)]
     countdown_until = 0.0
     target = None         # smoothed box of the person being tracked
@@ -714,6 +718,12 @@ def hands_loop():
         try: res = HANDS.detect(frame)
         except Exception as e: print(f"[hands] {e}"); time.sleep(1); continue
         h, w = frame.shape[:2]
+        def mine(b):                                          # only the tracked person's hands count
+            if (b[3] - b[1]) / h < 0.15: return False         # small = far away = someone in the background
+            t = S.face_target
+            if t is None: return True
+            return abs((b[0] + b[2]) / 2 / w - (t[0] + t[2] / 2)) < 0.45   # roughly in front of the tracked person
+        res = [r for r in res if mine(r[1])]
         S.hands = [(g, (b[0] / w, b[1] / h, (b[2] - b[0]) / w, (b[3] - b[1]) / h), [(x / w, y / h) for x, y in lm])
                    for g, b, lm, _ in res]
         g = next((r[0] for r in res if r[0] in GESTURE_ACTIONS), None)
@@ -833,7 +843,7 @@ def detect_faces(frame):
     if _yunet is not None:
         _yunet.setInputSize((w, h))
         _, res = _yunet.detect(frame)
-        boxes = [] if res is None else [tuple(float(v) for v in r[:4]) for r in res]
+        boxes = [] if res is None else [tuple(float(v) for v in r[:4]) for r in res if r[14] >= 0.75]
     elif _face_cascade is not None:
         boxes = _face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80, 80))
     else:
@@ -842,26 +852,59 @@ def detect_faces(frame):
     for x, y, bw, bh in boxes:
         x, y = max(0.0, x), max(0.0, y)
         out.append((x / w, y / h, min(bw, w - x) / w, min(bh, h - y) / h))
-    return sorted(out, key=lambda b: -b[2] * b[3])
+    out.sort(key=lambda b: -b[2] * b[3])
+    # Foreground only: people walking by in the background are small. Drop faces below FACE_MIN of the frame
+    # height, and anything much smaller than the nearest face.
+    if out:
+        big = out[0][3]
+        out = [b for b in out if b[3] >= FACE_MIN and b[3] >= big * 0.6]
+    return out
+
+def _center(b): return b[0] + b[2] / 2, b[1] + b[3] / 2
 
 def update_target(faces, now):
-    """Pick who to track and smooth their box. Sticks with the same person instead of jumping to whoever is biggest."""
-    if not faces:
-        if now - S.last_face_t > 0.6: S.face_target = None  # brief misses (blinks, motion blur) keep the lock
+    """Lock onto one main person and stay on them.
+    - Locking on needs a big, fairly central face that stays put for ~0.3s (a passerby doesn't qualify).
+    - Once locked, only a face near where you were counts as you. Other faces never steal the lock.
+    - If you're hidden briefly (turned away, hand in front), the lock holds for LOCK_HOLD seconds."""
+    if S.face_target is not None:
+        tcx, tcy = _center(S.face_target)
+        gate = max(0.08, 0.6 * S.face_target[2])            # how far you can move between frames and still be "you"
+        th = S.face_target[3]
+        near = [f for f in faces if ((_center(f)[0] - tcx) ** 2 + (_center(f)[1] - tcy) ** 2) ** 0.5 < gate
+                and 0.65 < f[3] / th < 1.5]                 # and about your size (not someone leaning in behind you)
+        if near:
+            best = min(near, key=lambda f: (_center(f)[0] - tcx) ** 2 + (_center(f)[1] - tcy) ** 2)
+            if now - S.last_face_t > 0.25:                  # you were hidden: make sure this is you settling back,
+                r = S.reacquire                             # not someone walking through your spot
+                if r and ((_center(best)[0] - _center(r[0])[0]) ** 2 + (_center(best)[1] - _center(r[0])[1]) ** 2) ** 0.5 < 0.05:
+                    S.reacquire = (r[0], r[1] + 1)
+                else:
+                    S.reacquire = (best, 1)
+                if S.reacquire[1] < 6:
+                    if now - S.last_face_t > LOCK_HOLD: S.face_target, S.candidate, S.reacquire = None, None, None
+                    return
+            S.reacquire = None
+            S.last_face_t = now
+            a = 0.45                                        # smoothing: higher = snappier, lower = steadier
+            S.face_target = tuple(o * (1 - a) + n * a for o, n in zip(S.face_target, best))
+        elif now - S.last_face_t > LOCK_HOLD:
+            S.face_target, S.candidate = None, None         # you're gone: free to lock onto someone new
         return
-    S.last_face_t = now
-    if S.face_target is None:
-        S.face_target = faces[0]; return
-    tx, ty, tw, th = S.face_target
-    tcx, tcy = tx + tw / 2, ty + th / 2
-    def score(b):                                           # prefer close to the current target, then size
-        d = ((b[0] + b[2] / 2 - tcx) ** 2 + (b[1] + b[3] / 2 - tcy) ** 2) ** 0.5
-        return d - 0.5 * b[2] * b[3]
-    best = min(faces, key=score)
-    if ((best[0] + best[2] / 2 - tcx) ** 2 + (best[1] + best[3] / 2 - tcy) ** 2) ** 0.5 > 0.35 and best is not faces[0]:
-        best = faces[0]                                     # target clearly gone: take the biggest face
-    a = 0.45                                                # smoothing: higher = snappier, lower = steadier
-    S.face_target = tuple(o * (1 - a) + n * a for o, n in zip(S.face_target, best))
+    if not faces:
+        S.candidate = None; return
+    # not locked yet: score by size and how central the face is, then require it to persist
+    def appeal(f):
+        cx, cy = _center(f)
+        return f[2] * f[3] * (1.0 - 0.8 * min(1.0, abs(cx - 0.5) * 2))
+    pick = max(faces, key=appeal)
+    c = S.candidate                                         # (where they first appeared, frames seen)
+    if c and ((_center(pick)[0] - _center(c[0])[0]) ** 2 + (_center(pick)[1] - _center(c[0])[1]) ** 2) ** 0.5 < 0.1:
+        S.candidate = (c[0], c[1] + 1)
+        if S.candidate[1] >= 15:                            # stayed put ~0.5s: someone sitting here, not walking by
+            S.face_target, S.candidate, S.last_face_t = pick, None, now
+    else:
+        S.candidate = (pick, 1)
 
 # ------------------------------------------------------------------ object tracking (VitTrack, OpenCV Zoo)
 class Obj:
@@ -953,7 +996,7 @@ def draw_faces(img):
     h, w = img.shape[:2]
     cx0, cy0, cw, ch = S.crop
     ft = S.face_target if Obj.box is None else None
-    boxes = ([ft] if ft else []) + [f for f in S.faces if ft is None or abs(f[0] - ft[0]) + abs(f[1] - ft[1]) > 0.08]
+    boxes = [ft] if ft else []                                # only the person being tracked
     for i, (x, y, bw, bh) in enumerate(boxes):
         x1, y1 = int((x - cx0) / cw * w), int((y - cy0) / ch * h)
         x2, y2 = int((x + bw - cx0) / cw * w), int((y + bh - cy0) / ch * h)
