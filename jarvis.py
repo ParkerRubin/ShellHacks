@@ -3,7 +3,8 @@ JARVIS: voice-driven camera assistant that acts on your computer.
 ElevenLabs Conversational AI (voice + tool calls) + Gemini (vision) + OpenCV (camera).
 
 Window keys:
-  SPACE mic mute / wake   C follow me (auto-framing)   F fullscreen   M fit/fill   T pin on top
+  Clickable control bar at the bottom. Mouse wheel zooms toward the cursor, drag pans when zoomed.
+  SPACE mic mute / wake   A autonomy   S servo test   C follow me (auto-framing)   F fullscreen   M fit/fill   T pin on top
   P photo   R record   + / - zoom   arrows pan   0 reset zoom   H help   ESC quit
 The window can be dragged to any size or shape; the picture adapts.
 """
@@ -27,8 +28,11 @@ CAM_BACKEND   = os.getenv("CAM_BACKEND", "auto").lower()      # auto, dshow, msm
 HALF_DUPLEX   = os.getenv("HALF_DUPLEX", "1") == "1"          # mute mic while JARVIS talks (stops it hearing itself); 0 if on headphones
 MAX_ZOOM      = 8.0
 WATCH_EVERY   = float(os.getenv("WATCH_EVERY", "4"))      # seconds between watch checks
-SERVO_ENABLED = os.getenv("SERVO_ENABLED", "0") == "1"    # flip on once the Arduino is back in use
-SERVO_PORT    = os.getenv("SERVO_PORT", "COM3")
+SERVO_ENABLED = os.getenv("SERVO_ENABLED", "1") == "1"        # tries to connect; runs fine without the Arduino
+SERVO_PORT    = os.getenv("SERVO_PORT", "auto")                # "auto" finds the Arduino, or e.g. COM3
+SERVO_KP      = float(os.getenv("SERVO_KP", "10"))             # tracking strength (degrees per update at full-frame error)
+PAN_DIR       = -1 if os.getenv("SERVO_INVERT_PAN", "0") == "1" else 1    # flip if it turns away from you
+TILT_DIR      = -1 if os.getenv("SERVO_INVERT_TILT", "0") == "1" else 1
 AUTONOMY      = os.getenv("AUTONOMY", "aware")                # off, aware (silent awareness), proactive (speaks up on its own)
 GLANCE_EVERY  = float(os.getenv("GLANCE_EVERY", "30"))        # seconds between background scene checks while you're in frame
 SPEAK_GAP     = float(os.getenv("SPEAK_GAP", "120"))          # minimum seconds between unprompted remarks
@@ -73,6 +77,7 @@ class State:
     speaking_until = 0.0  # when JARVIS's queued audio finishes playing
     voice_on = False; want_voice = True
     last_user_t = 0.0     # last time the user spoke
+    disp_map = (0, 0, 1, 1); buttons = []; bar_top = 10000; drag = None
     quit = False
 
 S = State()
@@ -446,15 +451,21 @@ def sleep(p):
 
 
 # ------------------------------------------------------------------ autonomy
+# Nothing here decides *what* to say. Local sensors (face detector) note events; a vision model looks at the
+# scene plus recent context and decides whether a thoughtful assistant would speak. Rails only stop it from
+# interrupting or talking too often.
 class A:
     level = AUTONOMY if AUTONOMY in ("off", "aware", "proactive") else "aware"
-    present = False; present_since = 0.0; absent_since = 0.0; seen_once = False
-    last_glance = 0.0; last_scene = ""; last_spoke = 0.0; last_ping = 0.0
-    multi_since = None; multi_announced = False; break_nudged_at = 0.0
+    present = False; present_since = 0.0; absent_since = 0.0
+    people = 0; people_since = 0.0
+    last_think = 0.0; think_asap = False; last_scene = ""
+    last_spoke = 0.0; last_ping = 0.0
+    events = []           # (time, text)
+    busy = False
 
-def _fmt(sec):
-    m = int(sec // 60)
-    return f"{m} minute{'s' if m != 1 else ''}" if m else f"{int(sec)} seconds"
+def _ago(sec):
+    sec = max(0, int(sec))
+    return f"{sec // 60} min ago" if sec >= 60 else f"{sec}s ago"
 
 def ctx(text):
     """Silent background note: the agent knows it but doesn't respond."""
@@ -464,11 +475,11 @@ def ctx(text):
     except Exception as e: print(f"[ctx] failed: {e}")
 
 def say(text, gap=None):
-    """Ask the agent to speak on its own, only when it won't talk over anyone."""
+    """Let the agent speak on its own, but never over the user or too often."""
     now, c = time.time(), convo
     gap = SPEAK_GAP if gap is None else gap
     if (A.level != "proactive" or c is None or not S.voice_on or S.mic_muted
-            or now < S.speaking_until + 1.5 or now - S.last_user_t < 15 or now - A.last_spoke < gap):
+            or now < S.speaking_until + 1.5 or now - S.last_user_t < 12 or now - A.last_spoke < gap):
         return False
     try:
         c.send_user_message(text); A.last_spoke = now; print(f"[proactive] {text}")
@@ -476,67 +487,78 @@ def say(text, gap=None):
     except Exception as e:
         print(f"[proactive] failed: {e}"); return False
 
-def glance():
+def event(text):
+    A.events = (A.events + [(time.time(), text)])[-8:]
+    ctx(f"[Presence] {text}")
+    A.think_asap = True
+
+def think(triggered_by_event):
     frame = current_raw()
     if frame is None: return
+    now = time.time()
+    events = "; ".join(f"{t} ({_ago(now - ts)})" for ts, t in A.events[-5:]) or "none"
+    you, you_t = S.cap_user; me, me_t = S.cap_agent
+    talk = (f'User last said "{you}" {_ago(now - you_t)}. ' if you else "User hasn't spoken yet. ") + \
+           (f'JARVIS last said "{me}" {_ago(now - me_t)}.' if me else "")
+    sitting = f"The user has been in front of the camera for {_ago(now - A.present_since).replace(' ago', '')}." if A.present else ""
     try:
         res = gemini_json(
-            "You are the eyes of a friendly desk assistant watching through a webcam. "
-            f'Previous observation: "{A.last_scene or "none"}". Reply only with JSON: '
-            '{"summary": "one sentence: who is there, what they are doing, anything they are holding", '
-            '"changed": true only if something meaningfully new vs the previous observation (an object held up, a new person, a new activity), '
-            '"remark": "if changed, one short friendly thing an assistant might say or ask about it, else empty"}', frame)
+            "You are the judgment of JARVIS, a warm, sharp desk assistant who sees through a webcam and talks out loud. "
+            "Decide if JARVIS should say something unprompted right now, the way a thoughtful person sitting at the desk would. "
+            "Good reasons: someone arrived or came back, a new person appeared, the user is showing or holding something up, "
+            "something looks wrong or unsafe, they've been at it a long time, or a genuinely useful observation. "
+            "Stay quiet when the scene is routine or unchanged, when the user seems focused, or when it would just be filler.\n"
+            f'Previous observation: "{A.last_scene or "none"}"\nRecent events: {events}\n{talk}\n{sitting}\n'
+            'Reply only with JSON: {"summary": "one sentence: who is there, what they are doing or holding", '
+            '"speak": true or false, "say": "if speak, the short natural sentence or question JARVIS would say"}', frame)
     except Exception as e:
-        print(f"[glance] {e}"); return
+        print(f"[think] {e}"); return
     summary = (res.get("summary") or "").strip()
-    if not summary or summary == A.last_scene: return
-    A.last_scene = summary
-    add_log("scene", text=summary)
-    ctx(f"[Scene {datetime.datetime.now():%H:%M}] {summary}")
-    if res.get("changed") and res.get("remark"):
-        say(f"[Camera event] You noticed: {summary} If it feels natural, say something like: \"{res['remark']}\" One short sentence.")
+    if summary and summary != A.last_scene:
+        A.last_scene = summary
+        add_log("scene", text=summary)
+        ctx(f"[Scene {datetime.datetime.now():%H:%M}] {summary}")
+    if res.get("speak") and res.get("say"):
+        say(f"[Camera event] {summary} You want to say: \"{res['say']}\" Say it naturally in your own words, one short sentence.",
+            gap=30 if triggered_by_event else None)
+
+def _think_async(ev):
+    def run():
+        try: think(ev)
+        finally: A.busy = False
+    A.busy = True
+    threading.Thread(target=run, daemon=True).start()
 
 def autonomy_loop():
     while not S.quit:
-        time.sleep(1)
+        time.sleep(0.5)
         now = time.time()
         seen = now - S.last_face_t < 3
-        # arrivals and departures, from the face detector (free, no API calls)
         if seen and not A.present:
             away = now - A.absent_since if A.absent_since else 0
             A.present, A.present_since = True, now
-            ctx(f"[Presence] The user is in front of the camera{f' again after {_fmt(away)} away' if away else ''}.")
-            if A.seen_once and away > 60:
-                say(f"[Camera event] The user just came back after {_fmt(away)} away. Welcome them back in a few words.", gap=30)
-            A.seen_once = True
+            event(f"user is back after {_ago(away).replace(' ago', '')} away" if away > 20 else "user is in front of the camera")
         elif A.present and now - S.last_face_t > 10:
             A.present, A.absent_since = False, S.last_face_t
-            ctx("[Presence] The user stepped away from the camera.")
-        # someone else joins
+            event("user stepped away from the camera")
         n = len(S.faces) if seen else 0
-        if n >= 2:
-            A.multi_since = A.multi_since or now
-            if now - A.multi_since > 3 and not A.multi_announced:
-                A.multi_announced = True
-                ctx(f"[Presence] {n} people are in view.")
-                say("[Camera event] Someone else just joined the user in frame. Acknowledge them briefly and naturally.", gap=45)
-        elif A.multi_since and now - A.multi_since > 10:
-            A.multi_since, A.multi_announced = None, False
-        # long sitting: one stretch nudge per hour
-        if A.present and now - A.present_since > 50 * 60 and now - A.break_nudged_at > 3600:
-            if say(f"[Camera event] The user has been at the desk for {_fmt(now - A.present_since)} straight. Suggest a quick stretch break in one friendly sentence."):
-                A.break_nudged_at = now
-        if not (A.present and S.voice_on and A.level != "off"):
+        if n != A.people:
+            if A.people_since == 0: A.people_since = now
+            elif now - A.people_since > 3:               # count held steady for 3s
+                if n > A.people and A.people >= 1: event(f"{n} people are now in view")
+                A.people, A.people_since = n, 0.0
+        else:
+            A.people_since = 0.0
+        if not (S.voice_on and A.level != "off"):
             continue
-        # keep the call alive while you're here, even if you're quiet
-        if now - A.last_ping > 20:
+        if A.present and now - A.last_ping > 20:           # keep the call alive while you're here
             A.last_ping = now
             try: convo.register_user_activity()
             except Exception: pass
-        # periodic look at the scene: silent note, spoken only if something new and proactive
-        if now - A.last_glance > GLANCE_EVERY and now > S.speaking_until + 2 and now - S.last_user_t > 8:
-            A.last_glance = now
-            glance()
+        due = A.present and now - A.last_think > GLANCE_EVERY
+        if (A.think_asap or due) and not A.busy and now > S.speaking_until + 2 and now - S.last_user_t > 6:
+            ev, A.think_asap, A.last_think = A.think_asap, False, now
+            _think_async(ev)
 
 @tool
 def set_autonomy(p):
@@ -548,24 +570,69 @@ def set_autonomy(p):
             "aware": "I'll keep an eye on things quietly and only speak when you talk to me.",
             "proactive": "I'll speak up on my own when something worth mentioning happens."}[lvl]
 
-# ------------------------------------------------------------------ optional servo (off by default)
-ser = None
-if SERVO_ENABLED:
-    try:
-        import serial
-        ser = serial.Serial(SERVO_PORT, 115200, timeout=1); time.sleep(2)
-        print("Servos connected")
-    except Exception as e:
-        print("No servos:", e)
-_pan_s, _pan_sent = 90.0, 90
-def drive_servo(target):
-    global _pan_s, _pan_sent
-    _pan_s = _pan_s * 0.8 + target * 0.2
-    val = int(_pan_s)
-    if ser and abs(val - _pan_sent) >= 2:
-        try: ser.write(f"{val},90\n".encode())
-        except Exception: pass
-        _pan_sent = val
+# ------------------------------------------------------------------ servos (pan/tilt head)
+class Servo:
+    ser = None; port = None
+    pan = 90.0; tilt = 90.0; sent = (None, None); last_send = 0.0
+    manual_until = 0.0     # after a turn_camera command, tracking waits so it doesn't fight you
+
+    @classmethod
+    def connect(cls):
+        if not SERVO_ENABLED: return
+        try:
+            import serial, serial.tools.list_ports
+        except ImportError:
+            print("pyserial not installed, servos off"); return
+        ports = [SERVO_PORT] if SERVO_PORT != "auto" else \
+            [p.device for p in serial.tools.list_ports.comports()
+             if any(k in f"{p.description} {p.manufacturer}".lower() for k in ("arduino", "ch340", "usb serial", "usb-serial", "cp210"))]
+        for port in ports:
+            try:
+                cls.ser = serial.Serial(port, 115200, timeout=0.1); cls.port = port
+                time.sleep(2)                                    # opening the port resets the Arduino
+                print(f"Servos connected on {port}: {cls.ser.read(64).decode(errors='ignore').strip() or '(no banner)'}")
+                cls.send(force=True); return
+            except Exception as e:
+                print(f"Servo port {port}: {e}")
+        print("No Arduino found, servos off. Set SERVO_PORT in .env if it's plugged in.")
+
+    @classmethod
+    def send(cls, force=False):
+        if cls.ser is None: return
+        cls.pan, cls.tilt = min(max(cls.pan, 20), 160), min(max(cls.tilt, 45), 135)
+        cur = (int(round(cls.pan)), int(round(cls.tilt)))
+        now = time.time()
+        if force or (cur != cls.sent and now - cls.last_send > 0.03):
+            try: cls.ser.write(f"{cur[0]},{cur[1]}\n".encode()); cls.sent, cls.last_send = cur, now
+            except Exception as e: print(f"Servo write failed: {e}"); cls.ser = None
+
+    @classmethod
+    def track(cls, now):
+        """Closed-loop: nudge the head so the main face moves toward the center of the frame."""
+        if cls.ser is None or now < cls.manual_until: return
+        if S.faces and now - S.last_face_t < 0.5:
+            x, y, w, h = S.faces[0]
+            ex, ey = (x + w / 2) - 0.5, (y + h / 2) - 0.45
+            if abs(ex) > 0.06: cls.pan -= PAN_DIR * max(-4, min(4, ex * SERVO_KP))
+            if abs(ey) > 0.08: cls.tilt += TILT_DIR * max(-3, min(3, ey * SERVO_KP))
+        elif now - S.last_face_t > 10:                           # nobody for a while: drift home
+            cls.pan += (90 - cls.pan) * 0.02; cls.tilt += (90 - cls.tilt) * 0.02
+        cls.send()
+
+@tool
+def turn_camera(p):
+    if Servo.ser is None: return "The servo head isn't connected, so I can't physically turn."
+    d = str(arg(p, "direction", "")).lower()
+    deg = num(arg(p, "degrees"), 25)
+    if d == "left": Servo.pan += PAN_DIR * deg
+    elif d == "right": Servo.pan -= PAN_DIR * deg
+    elif d == "up": Servo.tilt -= TILT_DIR * deg
+    elif d == "down": Servo.tilt += TILT_DIR * deg
+    elif d == "center": Servo.pan, Servo.tilt = 90, 90
+    else: return "Direction must be left, right, up, down, or center."
+    Servo.manual_until = time.time() + 8
+    Servo.send(force=True)
+    return f"Turned {d}."
 
 # ------------------------------------------------------------------ camera + window
 _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -619,18 +686,22 @@ def draw_faces(img):
 
 def fit_to_window(img, ww, wh, mode):
     ih, iw = img.shape[:2]
-    if ww < 50 or wh < 50: return img.copy()
+    if ww < 50 or wh < 50:
+        S.disp_map = (0, 0, iw, ih); return img.copy()
     ww, wh = min(ww, 3840), min(wh, 2160)
-    if (ww, wh) == (iw, ih): return img.copy()
+    if (ww, wh) == (iw, ih):
+        S.disp_map = (0, 0, iw, ih); return img.copy()
     if mode == "fill":
         s = max(ww / iw, wh / ih)
         r = cv2.resize(img, (max(1, int(iw * s)), max(1, int(ih * s))), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
         y0, x0 = (r.shape[0] - wh) // 2, (r.shape[1] - ww) // 2
+        S.disp_map = (-x0, -y0, r.shape[1], r.shape[0])
         return r[y0:y0 + wh, x0:x0 + ww].copy()
     s = min(ww / iw, wh / ih)
     nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
     out = np.zeros((wh, ww, 3), np.uint8)
     y0, x0 = (wh - nh) // 2, (ww - nw) // 2
+    S.disp_map = (x0, y0, nw, nh)
     out[y0:y0 + nh, x0:x0 + nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     return out
 
@@ -658,7 +729,7 @@ def draw_hud(img):
     now = time.time()
     if now < S.flash_until:
         cv2.addWeighted(img, 0.4, np.full_like(img, 255), 0.6, 0, img)
-    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}"
+    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}" + (f"  SERVO:{Servo.port}" if Servo.ser else "")
     put(img, top, (int(16 * sc), lh), sc, (120, 230, 255), 2)
     vl, vc = voice_label()
     put(img, vl, (int(16 * sc), lh * 2), sc * 0.7, vc, 2)
@@ -671,7 +742,7 @@ def draw_hud(img):
         if int(now * 2) % 2: cv2.circle(img, (x - tw - int(18 * sc), lh - int(9 * sc)), int(9 * sc), (0, 0, 255), -1)
     if S.watch_target:
         put(img, f"WATCHING: {S.watch_target}", (int(16 * sc), lh * 3), sc * 0.7, (120, 255, 120), 2)
-    y = h - int(16 * sc)
+    y = min(S.bar_top, h - 50) - int(10 * sc)
     n = max(20, int(w / (sc * 19)))
     for (txt, ts), who, col in ((S.cap_agent, "JARVIS", (255, 220, 120)), (S.cap_user, "You", (255, 255, 255))):
         if txt and now - ts < 8:
@@ -679,10 +750,80 @@ def draw_hud(img):
                 put(img, line, (int(16 * sc), y), sc * 0.75, col, 1); y -= int(lh * 0.9)
     if S.status and now < S.status_until:
         put(img, S.status, (int(16 * sc), y - int(lh * 0.3)), sc * 0.8, (120, 230, 255), 2)
-    if now < S.show_help_until:
-        help_ = "SPACE mic  A autonomy  C follow  F fullscreen  M fit/fill  T pin  P photo  R record  +/- zoom  arrows pan  0 reset  H help  ESC quit"
-        put(img, help_, (int(16 * sc), lh * 4), sc * 0.5, (200, 200, 200), 1)
+    draw_buttons(img)
     return img
+
+def button_defs():
+    return [
+        ("-",                               lambda: zoom({"direction": "out"}),   False),
+        (f"{S.zoom_t:.1f}x",                lambda: zoom({"level": 1}),           S.zoom_t > 1.01),
+        ("+",                               lambda: zoom({"direction": "in"}),    False),
+        ("Photo",                           lambda: threading.Thread(target=take_photo, args=({},), daemon=True).start(), False),
+        ("Stop" if S.writer else "Rec",     lambda: threading.Thread(target=_stop_recording if S.writer else _start_recording, daemon=True).start(), S.writer is not None),
+        ("Follow",                          lambda: follow_me({"on": not S.follow}), S.follow),
+        ("Mic" if not S.mic_muted else "Muted", toggle_mic,                      not S.mic_muted and S.voice_on),
+        ({"off": "Auto off", "aware": "Aware", "proactive": "Proactive"}[A.level],             lambda: set_autonomy({"level": {"off": "aware", "aware": "proactive"}.get(A.level, "off")}), A.level == "proactive"),
+        (S.fit_mode.capitalize(),           lambda: setattr(S, "fit_mode", "fill" if S.fit_mode == "fit" else "fit"), False),
+        ("Full",                            lambda: S.window_cmds.append(("toggle_fullscreen", None)), S.fullscreen),
+    ]
+
+def draw_buttons(img):
+    """Always-visible, clickable control bar along the bottom (mouse wheel zooms, drag pans)."""
+    h, w = img.shape[:2]
+    defs = button_defs()
+    pad, gap = 10, 6
+    scale = 0.55
+    widths = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] + 2 * pad for t, _, _ in defs]
+    total = sum(widths) + gap * (len(defs) - 1)
+    if total > w - 12:                                      # shrink to fit narrow windows
+        k = (w - 12) / total; scale *= k; widths = [int(x * k) for x in widths]; pad = int(pad * k); gap = max(2, int(gap * k))
+        total = sum(widths) + gap * (len(defs) - 1)
+    bh = max(22, int(34 * scale / 0.55))
+    y1 = h - 8; y0 = y1 - bh
+    x = (w - total) // 2
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x - 6, y0 - 6), (x + total + 6, y1 + 6), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
+    S.buttons = []
+    for (label, fn, active), bw in zip(defs, widths):
+        col = (60, 150, 60) if active else (70, 70, 70)
+        cv2.rectangle(img, (x, y0), (x + bw, y1), col, -1)
+        cv2.rectangle(img, (x, y0), (x + bw, y1), (160, 160, 160), 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        cv2.putText(img, label, (x + (bw - tw) // 2, y0 + (bh + th) // 2), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
+        S.buttons.append(((x, y0, x + bw, y1), fn))
+        x += bw + gap
+    S.bar_top = y0 - 6
+
+def screen_to_raw(mx, my):
+    """Window pixel -> normalized position in the full (unzoomed) camera frame."""
+    x0, y0, nw, nh = S.disp_map
+    u, v = (mx - x0) / max(nw, 1), (my - y0) / max(nh, 1)
+    cx0, cy0, cw, ch = S.crop
+    return cx0 + u * cw, cy0 + v * ch
+
+def on_mouse(ev, mx, my, flags, _):
+    if ev == cv2.EVENT_LBUTTONDOWN:
+        for (x0, y0, x1, y1), fn in S.buttons:
+            if x0 <= mx <= x1 and y0 <= my <= y1:
+                fn(); return
+        S.drag = (mx, my, S.cx_t, S.cy_t)
+    elif ev == cv2.EVENT_MOUSEMOVE and S.drag and (flags & cv2.EVENT_FLAG_LBUTTON) and S.zoom_t > 1.01:
+        sx, sy, cx, cy = S.drag
+        _, _, nw, nh = S.disp_map
+        S.follow = False
+        S.cx_t = min(max(cx - (mx - sx) / max(nw, 1) / S.zoom_t, 0), 1)
+        S.cy_t = min(max(cy - (my - sy) / max(nh, 1) / S.zoom_t, 0), 1)
+    elif ev == cv2.EVENT_LBUTTONUP:
+        S.drag = None
+    elif ev == cv2.EVENT_MOUSEWHEEL:
+        S.follow = False
+        up = flags > 0                                        # wheel delta lives in the high bits; sign = direction
+        if up:                                                # zoom toward the cursor
+            rx, ry = screen_to_raw(mx, my)
+            S.cx_t += (rx - S.cx_t) * 0.35; S.cy_t += (ry - S.cy_t) * 0.35
+        S.zoom_t = max(1.0, min(MAX_ZOOM, S.zoom_t * (1.2 if up else 1 / 1.2)))
+        if S.zoom_t <= 1.01: S.cx_t, S.cy_t = 0.5, 0.5
 
 def apply_window_cmds():
     while S.window_cmds:
@@ -709,12 +850,20 @@ def toggle_mic():
         S.mic_muted = not S.mic_muted
         set_status("Mic muted" if S.mic_muted else "Listening")
 
+def servo_test():
+    if Servo.ser is None: set_status("No servos connected"); return
+    set_status(f"Servo test on {Servo.port}")
+    Servo.manual_until = time.time() + 4
+    for p, t in ((60, 90), (120, 90), (90, 70), (90, 110), (90, 90)):
+        Servo.pan, Servo.tilt = p, t; Servo.send(force=True); time.sleep(0.6)
+
 def handle_key(k):
     if k == -1: return
     c = chr(k & 0xFF).lower() if k < 256 else ""
     if k == 27: shutdown()
     elif c == " ": toggle_mic()
     elif c == "c": follow_me({"on": not S.follow})
+    elif c == "s": threading.Thread(target=servo_test, daemon=True).start()
     elif c == "a": set_autonomy({"level": {"off": "aware", "aware": "proactive"}.get(A.level, "off")})
     elif c == "f": S.window_cmds.append(("toggle_fullscreen", None))
     elif c == "m": S.fit_mode = "fill" if S.fit_mode == "fit" else "fit"
@@ -755,6 +904,7 @@ def camera_loop():
     if cam is not None:
         WINDOW_PRESETS["windowed"] = (int(cam.get(3)) or 640, int(cam.get(4)) or 480)
     cv2.resizeWindow(WIN, *WINDOW_PRESETS["windowed"])
+    cv2.setMouseCallback(WIN, on_mouse)
     last_t, fails, n, fps_logged = time.time(), 0, 0, False
     blank = np.zeros((720, 1280, 3), np.uint8)
     while not S.quit:
@@ -774,10 +924,8 @@ def camera_loop():
             print(f"Running at ~{S.fps:.0f} fps" + ("  (slow: try CAM_RES=native or CAM_BACKEND=dshow in .env)" if S.fps < 15 else ""))
         if ok:
             S.faces = detect_faces(frame)
-            if S.faces:
-                S.last_face_t = now
-                x, y, fw, fh = S.faces[0]
-                if ser: drive_servo(160 - (x + fw / 2) * 140)
+            if S.faces: S.last_face_t = now
+        Servo.track(now)
         update_follow(now)
         view = apply_zoom(frame)
         with S.lock:
@@ -835,6 +983,7 @@ def on_user(t):   print("You:", t);    S.cap_user = (t, time.time()); S.last_use
 
 def main():
     global convo
+    Servo.connect()
     threading.Thread(target=camera_loop, daemon=True).start()
     threading.Thread(target=autonomy_loop, daemon=True).start()
     for _ in range(50):
