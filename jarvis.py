@@ -4,6 +4,7 @@ ElevenLabs Conversational AI (voice + tool calls) + Gemini (vision) + OpenCV (ca
 
 Window keys:
   Clickable control bar at the bottom. Mouse wheel zooms toward the cursor, drag pans when zoomed.
+  Left/right arrows turn the servo head by hand (auto-follow resumes 4s later; X turns auto-follow off/on).
   Right-drag a box around anything to track it (right-click to stop). Gestures: thumbs up photo, peace record,
   open palm mic, thumbs down reset.
   SPACE mic mute / wake   A autonomy   G gestures   S servo test   C follow me (auto-framing)   F fullscreen   M fit/fill   T pin on top
@@ -111,9 +112,9 @@ class State:
 S = State()
 convo = None
 
-def set_status(msg, secs=3.0):
+def set_status(msg, secs=3.0, log=True):
     S.status, S.status_until = msg, time.time() + secs
-    print(f"[status] {msg}")
+    if log: print(f"[status] {msg}")
 
 def add_log(kind, **kw):
     entry = {"kind": kind, "time": datetime.datetime.now().strftime("%H:%M:%S"), **kw}
@@ -818,6 +819,26 @@ class Servo:
                 set_status(f"Servo calibrated (pan {PAN_DIR:+d}, tilt {TILT_DIR:+d})", 4)
         cls.send()
     calib_retry = 0.0
+    auto = True            # X toggles face/object following on and off
+    STEP = float(os.getenv("SERVO_STEP", "5"))                         # degrees per arrow-key press (hold to keep turning)
+
+    @classmethod
+    def nudge(cls, direction):
+        """Arrow keys: -1 = turn left, +1 = turn right (as seen in the camera image). Tracking pauses while you steer."""
+        if cls.ser is None: return
+        cls.probe = None                                        # steering cancels a calibration nudge in progress
+        cls.pan -= PAN_DIR * direction * cls.STEP               # same convention as turn_camera
+        cls.pan = min(max(cls.pan, 20), 160)
+        cls.manual_until = time.time() + 4                      # auto-follow resumes 4s after your last press
+        cls.prev_world, cls.vel = None, (0.0, 0.0)
+        cls.send(force=True)
+        set_status(f"Manual: pan {int(cls.pan)}" + ("" if not cls.auto else " (auto-follow resumes in 4s)"), 1.5, log=False)
+
+    @classmethod
+    def toggle_auto(cls):
+        cls.auto = not cls.auto
+        cls.manual_until = 0.0
+        set_status("Servo auto-follow ON" if cls.auto else "Servo auto-follow OFF (arrows only)", 3)
     still_hist = deque(maxlen=30)                                       # recent (t, ex) to check you're sitting still
 
     @classmethod
@@ -857,7 +878,7 @@ class Servo:
         from where the head actually is (not where we last told it to go), leading a moving target slightly."""
         if cls.ser is None: return
         cls._simulate(now)
-        if now < cls.manual_until: return
+        if now < cls.manual_until or not cls.auto: return
         if S.aim is not None:
             ax, ay = S.aim
             vfov = CAM_HFOV * 0.75                                   # 4:3 webcam
@@ -1201,7 +1222,7 @@ def draw_hud(img):
     now = time.time()
     if now < S.flash_until:
         cv2.addWeighted(img, 0.4, np.full_like(img, 255), 0.6, 0, img)
-    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}" + (f"  SERVO:{Servo.port}" if Servo.ser else "") + f"  AI:{GEM['calls']}"
+    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}" + (f"  SERVO:{Servo.port} {'MANUAL' if (not Servo.auto or time.time() < Servo.manual_until) else 'AUTO'}" if Servo.ser else "") + f"  AI:{GEM['calls']}"
     put(img, top, (int(16 * sc), lh), sc, (120, 230, 255), 2)
     vl, vc = voice_label()
     put(img, vl, (int(16 * sc), lh * 2), sc * 0.7, vc, 2)
@@ -1347,6 +1368,7 @@ def handle_key(k):
     elif c == "c": follow_me({"on": not S.follow})
     elif c == "s": threading.Thread(target=servo_test, daemon=True).start()
     elif c == "k": Servo.recalibrate()
+    elif c == "x": Servo.toggle_auto()
     elif c == "g":
         global HANDS
         if HANDS: HANDS, S.hands = None, []; set_status("Gestures off")
@@ -1361,8 +1383,8 @@ def handle_key(k):
     elif c in ("-", "_"): zoom({"direction": "out"})
     elif c == "0": zoom({"level": 1})
     elif c == "h": S.show_help_until = time.time() + (0 if time.time() < S.show_help_until else 3600)
-    elif k == KEY_LEFT: pan({"direction": "left"})
-    elif k == KEY_RIGHT: pan({"direction": "right"})
+    elif k == KEY_LEFT: Servo.nudge(-1) if Servo.ser else pan({"direction": "left"})
+    elif k == KEY_RIGHT: Servo.nudge(+1) if Servo.ser else pan({"direction": "right"})
     elif k == KEY_UP: pan({"direction": "up"})
     elif k == KEY_DOWN: pan({"direction": "down"})
 
