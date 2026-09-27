@@ -440,3 +440,40 @@ def test_callback_enqueue_latency_is_bounded():
         assert sorted(samples)[94] < 0.005
     finally:
         ingestor.close()
+
+
+@pytest.mark.parametrize("box", [(30, 40, 20, 30), (0, 0, 20, 20), (80, 80, 20, 20)])
+def test_yunet_receives_padded_clamped_independent_crop(store, box):
+    import numpy as np
+
+    captured = []
+    frame = np.arange(100 * 100 * 3).reshape((100, 100, 3))
+    identifier = FaceIdentifier(
+        store,
+        PresenceState(),
+        SimpleNamespace(signature=lambda crop: captured.append(crop)),
+    )
+    identifier.submit(frame, box)
+    assert identifier.busy.acquire(timeout=1)
+    identifier.busy.release()
+    x, y, w, h = box
+    px, py = round(w * 0.3), round(h * 0.3)
+    expected = frame[
+        max(0, y - py) : min(100, y + h + py), max(0, x - px) : min(100, x + w + px)
+    ]
+    assert np.array_equal(captured[0], expected)
+    assert not np.shares_memory(captured[0], frame)
+
+
+def test_escape_shutdown_is_bounded():
+    from jarvis.runtime import close_and_exit
+
+    release = threading.Event()
+    exited = []
+    start = time.monotonic()
+    try:
+        close_and_exit(lambda: release.wait(5), timeout=0.02, exit_fn=exited.append)
+        assert time.monotonic() - start < 0.2
+        assert exited == [0]
+    finally:
+        release.set()

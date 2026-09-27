@@ -8,6 +8,7 @@ from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInt
 
 load_dotenv()
 from jarvis.memory import build_memory
+from jarvis.runtime import close_and_exit
 import atexit
 memory = build_memory()
 atexit.register(memory.close)
@@ -55,8 +56,7 @@ def camera_loop():
             memory.identifier.submit(frame, None)
         cv2.imshow("JARVIS (ESC quit)", frame)
         if cv2.waitKey(1) == 27:
-            memory.close()
-            os._exit(0)
+            close_and_exit(memory.close)
 
 def look(parameters):
     print(">>> LOOK TOOL FIRED")

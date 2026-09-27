@@ -83,7 +83,14 @@ class FaceIdentifier:
             self.last_run = time.monotonic()
             snapshot = self.presence.get()
             x, y, w, h = box
-            crop = frame[max(0, y) : y + h, max(0, x) : x + w].copy()
+            # YuNet needs context around the tight Haar detection. Add 30%
+            # of each dimension on each side, clamped to the camera frame.
+            pad_x, pad_y = round(w * 0.30), round(h * 0.30)
+            height, width = frame.shape[:2]
+            crop = frame[
+                max(0, y - pad_y) : min(height, y + h + pad_y),
+                max(0, x - pad_x) : min(width, x + w + pad_x),
+            ].copy()
 
             def work():
                 try:

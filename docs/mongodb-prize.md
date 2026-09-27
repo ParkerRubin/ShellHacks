@@ -30,3 +30,7 @@ No Charts dashboard or screenshot has been created yet. Fallback events currentl
 appear in local health logs, not a metrics collection, so do not claim a fallback
 chart is implemented. Do not expose decrypted transcripts, face vectors, names,
 connection strings, or encryption keys in judging screenshots.
+
+Recall is limited to the fixed roughly two-dozen-word topic vocabulary. Embeddings
+contain those tags only, not conversation text; the demo does not demonstrate
+general semantic memory or recall of arbitrary facts.

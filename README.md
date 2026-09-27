@@ -102,7 +102,8 @@ python -m scripts.delete_user USER_PROFILE_UUID
 - Anonymous exchanges store **only fixed-vocabulary topic tags**, not scrubbed
   free text. Anonymous recall is scoped to the current voice session.
 - Searchable topics come from a fixed non-personal vocabulary. Embeddings also
-  use only these tags, so semantic recall is deliberately topic-level.
+  use only these roughly two dozen tags, so recall is topic-level. This is not
+  general semantic search over conversation text.
 - Sensitive exchanges are not embedded. Personal recall requires personalization
   consent, filters by user, and rechecks identity after retrieval.
 - An encrypted SQLite mirror and transactional outbox are maintained even when
