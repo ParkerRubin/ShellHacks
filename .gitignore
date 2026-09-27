@@ -1,4 +1,13 @@
-﻿.env
-venv/
+.env
+.env.*
+!.env.example
+.venv/
 __pycache__/
-out_*.mp3
+*.py[cod]
+data/
+models/
+*.sqlite3*
+.pytest_cache/
+.hypothesis/
+*.mp3
+venv/

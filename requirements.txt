@@ -1,0 +1,10 @@
+pymongo>=4.10,<5
+cryptography>=42
+jsonschema>=4
+numpy
+python-dotenv
+google-generativeai
+google-genai>=1
+opencv-python>=4.8
+elevenlabs
+pyserial

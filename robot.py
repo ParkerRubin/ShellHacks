@@ -7,6 +7,10 @@ from elevenlabs.conversational_ai.conversation import Conversation, ClientTools
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
 
 load_dotenv()
+from jarvis.memory import build_memory
+import atexit
+memory = build_memory()
+atexit.register(memory.close)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 vision = genai.GenerativeModel("gemini-3.5-flash")
 client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
@@ -44,10 +48,15 @@ def camera_loop():
         faces = face.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80,80))
         if len(faces):
             x, y, fw, fh = max(faces, key=lambda f: f[2]*f[3])
+            memory.identifier.submit(frame, (x, y, fw, fh))
             drive_servo(160 - ((x + fw//2) / w) * 140)
             cv2.rectangle(frame, (x, y), (x+fw, y+fh), (0,255,0), 2)
+        else:
+            memory.identifier.submit(frame, None)
         cv2.imshow("JARVIS (ESC quit)", frame)
-        if cv2.waitKey(1) == 27: os._exit(0)
+        if cv2.waitKey(1) == 27:
+            memory.close()
+            os._exit(0)
 
 def look(parameters):
     print(">>> LOOK TOOL FIRED")
@@ -60,7 +69,10 @@ def look(parameters):
              "If nothing clear, say so.",
              {"mime_type": "image/jpeg", "data": buf.tobytes()}],
             generation_config={"max_output_tokens": 300})   # 300 so thinking tokens don't starve output
-        try: return r.text.strip()
+        try:
+            text = r.text.strip()
+            memory.ingestor.on_gemini(text)
+            return text
         except Exception: return "I couldn't make that out clearly."
     except Exception as e:
         return f"I had trouble seeing that: {e}"
@@ -69,12 +81,16 @@ threading.Thread(target=camera_loop, daemon=True).start()
 
 client_tools = ClientTools()
 client_tools.register("look", look)
+if memory.enabled:
+    client_tools.register("recall", lambda p: memory.retriever.recall(p.get("query", ""), memory.presence.user_id))
+    client_tools.register("remember_me", lambda p: memory.consent.remember(p.get("confirmed", False), p.get("name")))
+    client_tools.register("forget_me", lambda p: memory.consent.forget())
 
 convo = Conversation(
     client, AGENT_ID, requires_auth=True,
     audio_interface=DefaultAudioInterface(),
     client_tools=client_tools,     # <-- this was missing
-    callback_agent_response=lambda t: print("JARVIS:", t),
-    callback_user_transcript=lambda t: print("You:", t),
+    callback_agent_response=lambda t: (print("JARVIS:", t), memory.ingestor.on_agent(t)),
+    callback_user_transcript=lambda t: (print("You:", t), memory.ingestor.on_user(t)),
 )
 convo.start_session()

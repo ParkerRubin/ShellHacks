@@ -1,1 +1,167 @@
+# JARVIS robot
 
+JARVIS combines OpenCV face tracking, Arduino servo control, Gemini's `look` tool,
+and an ElevenLabs voice agent. The optional MongoDB memory path adds encrypted
+conversation history, consented face recognition, recall, and offline recovery.
+
+## Setup
+
+Use Python 3.11 or later. From this directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env              # Only on first setup; preserve an existing .env
+python scripts/gen_key.py
+```
+
+Put the generated key in `ENCRYPTION_KEY` in `.env`. Keep it for future runs and
+back it up securely: replacing it makes existing encrypted data unreadable.
+Set `GEMINI_API_KEY` and `ELEVENLABS_API_KEY`. The audio interface may require
+PyAudio and OS audio dependencies (`pip install 'elevenlabs[pyaudio]'`).
+
+For memory, set `MEMORY_ENABLED=true`. Without an Atlas URI, encrypted memory
+works locally in `data/fallback.sqlite3`. A missing/invalid encryption key disables
+memory with an error; the robot continues. `MEMORY_ENABLED=false` bypasses all
+memory initialization and does not register memory tools.
+
+For the robot, configure the camera index, serial port, ElevenLabs agent ID, and
+vision model in `robot.py` for your machine. The existing defaults use camera 1,
+`COM3`, and a project-specific ElevenLabs agent. Upload `firmware.ino` to your
+Arduino, then run:
+
+```bash
+python robot.py
+```
+
+The existing `look` tool sends a full camera frame to Gemini. Memory's face
+recognition runs locally; it stores no images.
+
+## Atlas setup
+
+1. Create an Atlas cluster and a database user with access to your chosen DB.
+2. Add your machine's IP to Atlas Network Access. Set `MONGODB_ATLAS_URI` to its
+   `mongodb+srv://...` connection string and `MONGODB_DB=jarvis_dev` (or `jarvis_demo`).
+3. Verify your account's embedding model, then provision the database:
+
+```bash
+python -m scripts.check_embeddings
+python -m scripts.provision
+```
+
+`gemini-embedding-001` with 768 dimensions was verified against the configured
+Gemini account during implementation on September 27, 2026. Re-run the check for
+your account before provisioning. Leave `EMBEDDING_MODEL` empty to disable
+embeddings. The original vision integration still uses `google-generativeai`;
+new embeddings use `google-genai`.
+
+Provisioning creates application-compatible `$jsonSchema` validators, a TTL index,
+timeline/profile/face indexes, `interactions_vec` Vector Search, and
+`interactions_text` Atlas Search. If search-index creation is unavailable, the
+script prints JSON definitions for the Atlas UI. Wait for indexes to become READY.
+Do not mix models or dimensions in an existing vector index; use a new database
+or explicitly re-embed old records when changing models.
+
+Configure the three client tools in your ElevenLabs dashboard using
+[the agent prompt and tool definitions](docs/elevenlabs-agent-prompt.md).
+Registration in Python alone does not configure the hosted agent.
+
+## Recognition and consent
+
+```bash
+python -m scripts.fetch_models
+```
+
+This downloads OpenCV Zoo's YuNet and SFace models to the ignored `models/`
+directory. YuNet provides landmarks for SFace alignment. Without these files,
+storage and recall still work, but enrollment is unavailable.
+
+The agent must explain the data being saved and ask for explicit consent before
+calling `remember_me(confirmed=true)`. Enrollment saves an encrypted face
+signature and profile. Subsequent exchanges are associated with that profile;
+earlier anonymous exchanges are never relinked. Recognition requires two
+agreeing matches; naming uses a higher confidence threshold. Leaving the camera
+clears identity. Face matching still requires real-world accuracy testing.
+
+`forget_me` immediately removes the local profile, signature, and associated
+history. If Atlas is configured, the response explicitly says remote deletion
+is queued. A durable tombstone blocks late writes and replays the deletion after
+any in-flight upload. Do not remove the local database while deletion is pending.
+An operator can delete by the opaque profile ID:
+
+```bash
+python -m scripts.delete_user USER_PROFILE_UUID
+```
+
+## What is persisted
+
+- Consented transcripts, replies, Gemini results, names, preferences, and face
+  vectors are inside authenticated Fernet ciphertext. Logs from the memory package
+  contain operation/type information, not transcript text or credentials.
+- Anonymous exchanges store **only fixed-vocabulary topic tags**, not scrubbed
+  free text. Anonymous recall is scoped to the current voice session.
+- Searchable topics come from a fixed non-personal vocabulary. Embeddings also
+  use only these tags, so semantic recall is deliberately topic-level.
+- Sensitive exchanges are not embedded. Personal recall requires personalization
+  consent, filters by user, and rechecks identity after retrieval.
+- An encrypted SQLite mirror and transactional outbox are maintained even when
+  Atlas is online. UUID upserts make replay idempotent. This is a single-robot
+  design, not a multi-device synchronization protocol.
+- Interactions expire after 90 days; inactive profiles and signatures after 180
+  days by default. Local cleanup runs hourly; Atlas uses interaction TTL indexes.
+- Queued callbacks are in memory until committed by the worker. Abrupt process
+  termination or a full 200-item queue can lose pending exchanges; overflow logs
+  a warning and drops the oldest. Graceful shutdown drains within a bounded wait.
+
+The original robot still prints conversation text to its terminal. Avoid retaining
+terminal recordings if transcript privacy is required.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MEMORY_ENABLED` | `true` in code; example uses `false` | Memory switch |
+| `ENCRYPTION_KEY` | required when enabled | Fernet key |
+| `MONGODB_ATLAS_URI` | empty | Empty means local-only |
+| `MONGODB_DB` | `jarvis` | Database/environment |
+| `LOCAL_FALLBACK_PATH` | `./data/fallback.sqlite3` | Encrypted local mirror/outbox |
+| `RETENTION_DAYS` | `90` | Interaction lifetime |
+| `PROFILE_RETENTION_DAYS` | `180` | Profile inactivity lifetime |
+| `EMBEDDING_MODEL` | empty | Optional verified Gemini model |
+| `EMBEDDING_DIM` | `768` | Must match model output and vector index |
+| `FACE_DETECTION_MODEL` | `models/face_detection_yunet_2023mar.onnx` | Landmark model |
+| `FACE_RECOGNITION_MODEL` | `models/face_recognition_sface_2021dec.onnx` | SFace model |
+| `FACE_MATCH_THRESHOLD` | `0.363` | Recognition cosine threshold |
+| `FACE_GREET_THRESHOLD` | `0.5` | Threshold for returning a saved name |
+
+## Tests and demos
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+python -m scripts.smoke
+python -m scripts.demo_memory                # Disposable local data; no cloud calls
+python -m scripts.benchmark_memory           # Disposable 10,000-record local benchmark
+python -m scripts.demo_memory --atlas        # Seeds/deletes demo data in the configured DB
+```
+
+Live Atlas tests require a **separate** `MONGODB_ATLAS_URI_TEST` environment
+variable. They create and remove a uniquely named `jarvis_test_*` database:
+
+```bash
+python -m pytest -m atlas -q
+```
+
+No Atlas URI was available during implementation, so live validator/search/TTL
+behavior remains unverified. The opt-in test covers validator rejection, TTL
+configuration, idempotent replay, and deletion. Search quality/index readiness
+and the 500 ms network target require the Atlas demo; local tests enforce the
+recall caller's timeout even when the backend hangs.
+
+Before the booth demo, test voice, `look`, face re-entry/deletion, and servo/frame
+rate with memory enabled, offline, and disabled. Atlas Charts and its screenshot
+are still manual setup; see [sponsor notes](docs/mongodb-prize.md).
+
+Implementation details and explicit differences from the draft spec are in
+[the implementation notes](docs/mongodb-implementation.md).

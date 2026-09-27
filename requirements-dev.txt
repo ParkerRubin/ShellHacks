@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+hypothesis>=6
+mongomock>=4
