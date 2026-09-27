@@ -14,6 +14,8 @@ import os, re, sys, json, time, html, threading, subprocess, webbrowser, datetim
 import warnings; warnings.filterwarnings("ignore")
 import cv2
 import numpy as np
+try: cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception: pass
 from google import genai
 from google.genai import types as gtypes
 from collections import deque
@@ -160,10 +162,12 @@ def check_models():
     """Drop fallback models this API key can't use (listing models doesn't cost quota)."""
     global MODEL_CHAIN
     try:
-        ok = {m.name.split("/")[-1] for m in GEMINI.models.list() if "generateContent" in (m.supported_actions or [])}
-        chain = [m for m in MODEL_CHAIN if m in ok]
+        ok = [m.name.split("/")[-1] for m in GEMINI.models.list() if "generateContent" in (m.supported_actions or [])]
+        skip = ("tts", "image", "live", "audio", "embed", "native", "exp", "preview", "thinking", "robotics", "computer")
+        extra = sorted((m for m in ok if "flash" in m and not any(k in m for k in skip)), reverse=True)
+        chain = [m for m in MODEL_CHAIN if m in ok] + [m for m in extra if m not in MODEL_CHAIN]
         if VISION_MODEL not in ok: print(f"Warning: {VISION_MODEL} isn't available to this key")
-        MODEL_CHAIN = chain or MODEL_CHAIN
+        MODEL_CHAIN = chain[:6] or MODEL_CHAIN
     except Exception as e:
         print(f"Couldn't list Gemini models ({e})")
     print("Vision models:", " -> ".join(MODEL_CHAIN))
@@ -177,7 +181,8 @@ def gemini(prompt, img=None, max_tokens=1024, json_mode=False, images=None):
     for label, im in images or []:
         parts += [label, jpg(im, 768)]
     cfg = gtypes.GenerateContentConfig(max_output_tokens=max_tokens,       # thinking tokens count against this, keep it roomy
-                                       response_mime_type="application/json" if json_mode else None)
+                                       response_mime_type="application/json" if json_mode else None,
+                                       automatic_function_calling=gtypes.AutomaticFunctionCallingConfig(disable=True))
     for name in MODEL_CHAIN:
         if _blocked.get(name, 0) > time.time(): continue
         try:
@@ -194,11 +199,12 @@ def gemini(prompt, img=None, max_tokens=1024, json_mode=False, images=None):
                 continue
             if "404" in msg or "not found" in msg.lower() or "not supported" in msg.lower():
                 _blocked[name] = time.time() + 86400
-                print(f"[gemini] {name} unavailable, trying the next model"); continue
+                print(f"[gemini] {name} unavailable ({msg[:120]}), trying the next model"); continue
             raise
     set_status("Gemini quota used up: vision paused", 10)
-    raise QuotaExhausted("My vision allowance from Google is used up for now, so I can't see at the moment. "
-                         "Turning on billing for the Gemini key fixes it.")
+    raise QuotaExhausted("VISION OFFLINE: no image was analyzed, so you saw nothing. Tell the user plainly that you "
+                         "can't see right now because the Gemini vision quota is used up. Do not describe the scene. "
+                         "(Turning on billing for the Gemini key fixes it.)")
 
 def gemini_json(prompt, img, max_tokens=1024):
     txt = gemini(prompt, img, max_tokens, json_mode=True)
@@ -254,7 +260,7 @@ def _start_recording(max_seconds=None):
         path = next_path("video", ".mp4")
         fps = max(5.0, min(60.0, S.fps))
         writer = None
-        for code in ("avc1", "mp4v"):                 # avc1 plays in browsers, mp4v is the fallback
+        for code in (os.getenv("VIDEO_CODEC", "mp4v"), "mp4v"):   # H.264 ("avc1") needs Cisco's openh264 DLL on Windows
             writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*code), fps, (w, h))
             if writer.isOpened(): break
         if not writer or not writer.isOpened(): return "I couldn't start the video writer."
@@ -698,7 +704,8 @@ def load_hand_models():
 
 def hands_loop():
     """Runs beside the camera loop (~8 checks/sec) so gesture detection never slows the video."""
-    hist, fired = deque(maxlen=6), {}
+    hist, fired = deque(maxlen=10), {}
+    need = {"Five": 8}                                        # ~1s for open palm, ~0.5s for the rest
     while not S.quit:
         t0 = time.time()
         frame = current_raw()
@@ -712,7 +719,7 @@ def hands_loop():
         g = next((r[0] for r in res if r[0] in GESTURE_ACTIONS), None)
         hist.append(g)
         now = time.time()
-        if g and hist.count(g) >= 4 and now - fired.get(g, 0) > 3:     # held ~0.5s, then 3s cooldown
+        if g and hist.count(g) >= need.get(g, 4) and now - fired.get(g, 0) > 3:   # held, then 3s cooldown
             fired[g] = now; hist.clear()
             label, action = GESTURE_ACTIONS[g]
             print(f"[gesture] {g} -> {label}")
