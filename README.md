@@ -166,3 +166,24 @@ are still manual setup; see [sponsor notes](docs/mongodb-prize.md).
 
 Implementation details and explicit differences from the draft spec are in
 [the implementation notes](docs/mongodb-implementation.md).
+
+## Positivity MVP (disabled by default)
+
+The optional `jarvis/positivity/` package implements notice, opt-out, per-face
+encouragement, draft remark validation and RAM-only expression proxy samples.
+It works with memory disabled and preserves the existing pan calculation.
+
+Keep `POSITIVITY_ENABLED=false` until the hardware voice spike and human review.
+To exercise it later, configure `POSITIVITY_VOICE_ID` to match your ElevenLabs
+agent, install `sounddevice`/OS audio support, and set `POSITIVITY_ENABLED=true`.
+`POSITIVITY_PRIVACY_MODE=crop` sends only a <=256 px face crop to Gemini after
+notice plus a two-second opt-out window; `tags_only` sends fixed local tags and a
+bank draft instead. Neither mode persists images, remarks or samples. The existing
+user-triggered `look` tool still sends its full frame as documented above.
+
+The draft lexicon and bank have **not** undergone human or diverse-panel review.
+Option A separate TTS playback is **unverified** alongside the live agent. Run
+`python -m scripts.voice_spike --option all` on the demo machine to record A/B/C
+results. See [implementation and deviations](docs/positivity-implementation.md)
+and [voice spike status](docs/positivity-voice-spike.md). Captions, public-demo
+privacy signage, live latency/FPS/soak checks and human review remain unfinished.

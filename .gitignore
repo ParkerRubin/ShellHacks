@@ -11,3 +11,7 @@ models/
 .hypothesis/
 *.mp3
 venv/
+
+# Keep the source-controlled regression fixtures, not runtime data.
+!tests/data/
+!tests/data/remarks_corpus.json

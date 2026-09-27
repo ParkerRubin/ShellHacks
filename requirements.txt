@@ -5,6 +5,8 @@ numpy
 python-dotenv
 google-generativeai
 google-genai>=1
-opencv-python>=4.8
+opencv-python>=4.8,<5
 elevenlabs
 pyserial
+# Optional in operation; used only for positivity option A playback / voice spike.
+sounddevice>=0.5
