@@ -40,7 +40,10 @@ CAM_HFOV      = float(os.getenv("CAM_HFOV", "60"))             # camera's horizo
 SERVO_GAIN    = float(os.getenv("SERVO_GAIN", "0.5"))          # share of the error fixed per move: lower = calmer, higher = snappier
 SERVO_LEAD    = float(os.getenv("SERVO_LEAD", "0.08"))         # seconds to aim ahead of a moving target
 CAM_LATENCY   = float(os.getenv("CAM_LATENCY", "0.07"))        # seconds between a frame being captured and us seeing it
-AIM_Y         = float(os.getenv("AIM_Y", "0.45"))              # where your eyes should sit vertically in the frame (0 top, 1 bottom)
+AIM_Y         = float(os.getenv("AIM_Y", "0.45"))
+SERVO_TILT    = os.getenv("SERVO_TILT", "0") == "1"            # the head is pan-only (left/right); set 1 if a tilt servo is added
+TILT_MIN      = float(os.getenv("TILT_MIN", "65"))             # tilt limits so it can't stare at the ceiling or the desk
+TILT_MAX      = float(os.getenv("TILT_MAX", "115"))              # where your eyes should sit vertically in the frame (0 top, 1 bottom)
 PAN_DIR       = -1 if os.getenv("SERVO_INVERT_PAN", "0") == "1" else 1    # flip if it turns away from you
 TILT_DIR      = -1 if os.getenv("SERVO_INVERT_TILT", "0") == "1" else 1
 GEMINI_FALLBACKS = [m.strip() for m in os.getenv("GEMINI_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash").split(",") if m.strip()]
@@ -754,34 +757,74 @@ class Servo:
     est_hist = deque(maxlen=60)                                        # (time, est_pan, est_tilt) for latency compensation
     manual_until = 0.0     # after a turn_camera command, tracking waits so it doesn't fight you
     EASE, MAX_STEP, TICK = 0.25, 4.0, 0.015                            # must match jarvis_servo.ino
+    calib = None           # None = directions not confirmed yet; "done" once measured (or loaded / set in .env)
+    probe = None           # (axis, phase, t0, e0, base) while a calibration nudge is running
+    DIRS_FILE = BASE / "models" / "servo_dirs.json"                     # measured directions, reused next run
 
     @classmethod
-    def connect(cls):
-        if not SERVO_ENABLED: return
+    def load_dirs(cls):
+        global PAN_DIR, TILT_DIR
+        if os.getenv("SERVO_INVERT_PAN") or os.getenv("SERVO_INVERT_TILT"):
+            cls.calib = "done"; return                                  # .env wins
         try:
-            import serial, serial.tools.list_ports
-        except ImportError:
-            print("pyserial not installed, servos off"); return
-        ports = [SERVO_PORT] if SERVO_PORT != "auto" else \
-            [p.device for p in serial.tools.list_ports.comports()
-             if any(k in f"{p.description} {p.manufacturer}".lower() for k in ("arduino", "ch340", "usb serial", "usb-serial", "cp210"))]
-        for port in ports:
-            try:
-                cls.ser = serial.Serial(port, 115200, timeout=0.2); cls.port = port
-                banner, t0 = b"", time.time()                    # opening the port resets the Arduino (~2-3s incl. wiggle)
-                while time.time() - t0 < 4 and b"ready" not in banner.lower():
-                    banner += cls.ser.read(64)
-                txt = banner.decode(errors="ignore").strip()
-                print(f"Servos connected on {port}: " + (txt if txt else "no reply (old firmware? upload jarvis_servo.ino)"))
-                cls.send(force=True); return
-            except Exception as e:
-                print(f"Servo port {port}: {e}")
-        print("No Arduino found, servos off. Set SERVO_PORT in .env if it's plugged in.")
+            d = json.loads(cls.DIRS_FILE.read_text()); PAN_DIR, TILT_DIR = int(d["pan"]), int(d["tilt"])
+            cls.calib = "done"
+            print(f"Servo directions (from last calibration): pan {PAN_DIR:+d}, tilt {TILT_DIR:+d}. Press K to recalibrate.")
+        except Exception:
+            print("Servo directions not calibrated yet: I'll nudge the head once when I first see you.")
+
+    @classmethod
+    def recalibrate(cls):
+        cls.calib, cls.probe = None, None
+        try: cls.DIRS_FILE.unlink()
+        except Exception: pass
+        set_status("Servo calibration: sit still in front of the camera")
+
+    @classmethod
+    def run_probe(cls, now, ex, ey):
+        """Calibration nudge: move one axis 8 degrees, see which way your face shifts in the image, and set that
+        axis's direction from it. A backwards axis is what sends the head running to the ceiling."""
+        global PAN_DIR, TILT_DIR
+        if cls.probe is None:
+            cls.probe = ("pan", "settle", now, None, (cls.est_pan, cls.est_tilt))
+            set_status("Calibrating servo head, hold still...", 3)
+        axis, phase, t0, e0, base = cls.probe
+        e = ex if axis == "pan" else ey
+        if phase == "settle":                                           # stand still briefly, record where you are
+            cls.pan, cls.tilt = base
+            if now - t0 > 0.3:
+                cls.probe = (axis, "move", now, e, base)
+                if axis == "pan": cls.pan = base[0] + 8
+                else: cls.tilt = base[1] + 8
+        elif phase == "move" and now - t0 > 0.55 + CAM_LATENCY:          # glide done and a fresh frame is in
+            d = e - e0
+            if not 0.05 < abs(d) < 0.3:                                 # too small: servo didn't turn. too big: you moved
+                print(f"[calibration] {axis}: unclear result ({d:+.3f}), will retry when you're still")
+                cls.probe = None; cls.pan, cls.tilt = base; cls.calib_retry = now + 3; return
+            if axis == "pan":
+                ok = (d > 0) == (PAN_DIR > 0)                           # model: +pan shifts you right in the image when PAN_DIR=+1
+                if not ok: PAN_DIR = -PAN_DIR
+            else:
+                ok = (d < 0) == (TILT_DIR > 0)                          # model: +tilt shifts you up in the image when TILT_DIR=+1
+                if not ok: TILT_DIR = -TILT_DIR
+            print(f"[calibration] {axis}: image shift {d:+.3f} -> direction {'OK' if ok else 'was backwards, flipped'}")
+            cls.pan, cls.tilt = base
+            if axis == "pan" and SERVO_TILT:
+                cls.probe = ("tilt", "settle", now, None, base)
+            else:
+                cls.probe, cls.calib = None, "done"
+                try: cls.DIRS_FILE.write_text(json.dumps({"pan": PAN_DIR, "tilt": TILT_DIR}))
+                except Exception: pass
+                set_status(f"Servo calibrated (pan {PAN_DIR:+d}, tilt {TILT_DIR:+d})", 4)
+        cls.send()
+    calib_retry = 0.0
+    still_hist = deque(maxlen=30)                                       # recent (t, ex) to check you're sitting still
 
     @classmethod
     def send(cls, force=False):
         if cls.ser is None: return
-        cls.pan, cls.tilt = min(max(cls.pan, 20), 160), min(max(cls.tilt, 45), 135)
+        if not SERVO_TILT: cls.tilt = 90.0
+        cls.pan, cls.tilt = min(max(cls.pan, 20), 160), min(max(cls.tilt, TILT_MIN), TILT_MAX)
         cur = (int(round(cls.pan)), int(round(cls.tilt)))
         now = time.time()
         if force or (cur != cls.sent and now - cls.last_send > 0.02):
@@ -821,6 +864,13 @@ class Servo:
             ex, ey = ax - 0.5, ay - AIM_Y
             # where you are in the world, in servo degrees. The image is ~CAM_LATENCY old, so measure from where
             # the head was pointing when it was captured, not where it is now (otherwise it chases its own motion)
+            if cls.calib != "done":                                  # don't chase anyone until directions are known
+                cls.still_hist.append((now, ex))
+                recent = [e for t_, e in cls.still_hist if now - t_ < 0.6]
+                still = len(recent) >= 8 and max(recent) - min(recent) < 0.03
+                if cls.probe is not None or (now >= cls.calib_retry and still and abs(ex) < 0.3):
+                    cls.run_probe(now, ex, ey)
+                return
             cp, ct = cls._pose_at(now - CAM_LATENCY)
             wx = cp - PAN_DIR * ex * CAM_HFOV
             wy = ct + TILT_DIR * ey * vfov
@@ -838,8 +888,10 @@ class Servo:
                 cls.tilt = cls.est_tilt + SERVO_GAIN * (wy - cls.est_tilt) + lead_y
         else:
             cls.prev_world, cls.vel = None, (0.0, 0.0)
-            if now - S.last_face_t > 10:                             # nobody for a while: drift home
-                cls.pan += (90 - cls.pan) * 0.02; cls.tilt += (90 - cls.tilt) * 0.02
+            if cls.probe is not None:                                # lost you mid-calibration: undo and retry later
+                cls.pan, cls.tilt = cls.probe[4]; cls.probe = None
+            if now - S.last_face_t > 2.5:                            # lost you: ease back to center to find you again
+                cls.pan += (90 - cls.pan) * 0.05; cls.tilt += (90 - cls.tilt) * 0.05
         cls.send()
 
 @tool
@@ -847,6 +899,8 @@ def turn_camera(p):
     if Servo.ser is None: return "The servo head isn't connected, so I can't physically turn."
     d = str(arg(p, "direction", "")).lower()
     deg = num(arg(p, "degrees"), 25)
+    if d in ("up", "down") and not SERVO_TILT:
+        return "My head only turns left and right, so I can't tilt up or down. The user can angle the camera by hand."
     if d == "left": Servo.pan += PAN_DIR * deg
     elif d == "right": Servo.pan -= PAN_DIR * deg
     elif d == "up": Servo.tilt -= TILT_DIR * deg
@@ -895,19 +949,22 @@ def detect_faces(frame):
         _yunet.setInputSize((w, h))
         _, res = _yunet.detect(frame)
         rows = [] if res is None else [r for r in res if r[14] >= 0.75]
+        SCORES.clear()
         boxes = [tuple(float(v) for v in r[:4]) for r in rows]
         eyes = [((float(r[4]) + float(r[6])) / 2 / w, (float(r[5]) + float(r[7])) / 2 / h) for r in rows]
+        scores = [float(r[14]) for r in rows]
     elif _face_cascade is not None:
         boxes = _face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80, 80))
         eyes = [((x + bw / 2) / w, (y + bh * 0.4) / h) for x, y, bw, bh in boxes]   # eyes sit ~40% down a face box
+        scores = [1.0] * len(boxes)
     else:
-        boxes, eyes = [], []
+        boxes, eyes, scores = [], [], []
     out = []
     EYES.clear()
-    for (x, y, bw, bh), e in zip(boxes, eyes):
+    for (x, y, bw, bh), e, sc in zip(boxes, eyes, scores):
         x, y = max(0.0, x), max(0.0, y)
         b = (x / w, y / h, min(bw, w - x) / w, min(bh, h - y) / h)
-        out.append(b); EYES[b] = e
+        out.append(b); EYES[b] = e; SCORES[b] = sc
     out.sort(key=lambda b: -b[2] * b[3])
     # Foreground only: people walking by in the background are small. Drop faces below FACE_MIN of the frame
     # height, and anything much smaller than the nearest face.
@@ -917,6 +974,7 @@ def detect_faces(frame):
     return out
 
 EYES = {}   # face box -> eye midpoint (normalized), for the current frame
+SCORES = {} # face box -> detector confidence
 
 def _center(b): return b[0] + b[2] / 2, b[1] + b[3] / 2
 
@@ -960,7 +1018,10 @@ def update_target(faces, now):
     def appeal(f):
         cx, cy = _center(f)
         return f[2] * f[3] * (1.0 - 0.8 * min(1.0, abs(cx - 0.5) * 2))
-    pick = max(faces, key=appeal)
+    confident = [f for f in faces if SCORES.get(f, 1.0) >= 0.88]   # locking on needs a clear, real face
+    if not confident:
+        S.candidate = None; return
+    pick = max(confident, key=appeal)
     c = S.candidate                                         # (where they first appeared, frames seen)
     if c and ((_center(pick)[0] - _center(c[0])[0]) ** 2 + (_center(pick)[1] - _center(c[0])[1]) ** 2) ** 0.5 < 0.1:
         S.candidate = (c[0], c[1] + 1)
@@ -1285,6 +1346,7 @@ def handle_key(k):
     elif c == " ": toggle_mic()
     elif c == "c": follow_me({"on": not S.follow})
     elif c == "s": threading.Thread(target=servo_test, daemon=True).start()
+    elif c == "k": Servo.recalibrate()
     elif c == "g":
         global HANDS
         if HANDS: HANDS, S.hands = None, []; set_status("Gestures off")
@@ -1416,6 +1478,7 @@ def main():
     check_models()
     load_face_model()
     load_hand_models()
+    Servo.load_dirs()
     Servo.connect()
     threading.Thread(target=camera_loop, daemon=True).start()
     threading.Thread(target=hands_loop, daemon=True).start()

@@ -33,7 +33,7 @@ Keys: `SPACE` mic mute / wake, `G` gestures, `A` autonomy, `C` follow me, `S` se
 
 ## Servo head
 
-Upload `jarvis_servo/jarvis_servo.ino` with the Arduino IDE (pan signal on pin 9, tilt on pin 10). On power-up it wiggles once so you know it's alive. `jarvis.py` finds the Arduino automatically, and the HUD shows `SERVO:COMx` when connected. Close the Arduino IDE's Serial Monitor first, since only one program can hold the port. If it turns away from you, set `SERVO_INVERT_PAN=1` (or `SERVO_INVERT_TILT=1`) in `.env`. Two servos on the Arduino's 5V pin often brown out, so an external 5V supply (grounds connected) is the fix if they jitter or don't move.
+Upload `jarvis_servo/jarvis_servo.ino` with the Arduino IDE (pan signal on pin 9, tilt on pin 10). On power-up it wiggles once so you know it's alive. `jarvis.py` finds the Arduino automatically, and the HUD shows `SERVO:COMx` when connected. Close the Arduino IDE's Serial Monitor first, since only one program can hold the port. The head is pan-only (left and right). The first time it sees you, it nudges 8° to measure which way it turns and saves that to `models/servo_dirs.json`, so a backwards-mounted servo never runs away. Press `K` to recalibrate after remounting. `SERVO_INVERT_PAN=1` in `.env` skips calibration and forces the direction. Two servos on the Arduino's 5V pin often brown out, so an external 5V supply (grounds connected) is the fix if they jitter or don't move.
 
 ## Tools
 
