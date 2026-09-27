@@ -1,8 +1,9 @@
-# list_models.py
-import os, google.generativeai as genai
+# Lists the Gemini models your API key can use (costs no quota).
+import os
 from dotenv import load_dotenv
+from google import genai
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-for m in genai.list_models():
-    if "generateContent" in m.supported_generation_methods:
-        print(m.name)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+for m in client.models.list():
+    if "generateContent" in (m.supported_actions or []):
+        print(m.name.split("/")[-1])

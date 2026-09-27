@@ -211,5 +211,35 @@
     "required": [
       "level"
     ]
+  },
+  {
+    "name": "turn_camera",
+    "description": "Physically turn the robot's camera head (pan/tilt servos) to look somewhere else. It normally tracks the user's face on its own; use this when asked to look in a direction or to look around.",
+    "parameters": {
+      "direction": {
+        "type": "string",
+        "description": "left, right, up, down, or center."
+      },
+      "degrees": {
+        "type": "number",
+        "description": "Optional. How far to turn, default 25."
+      }
+    },
+    "required": [
+      "direction"
+    ]
+  },
+  {
+    "name": "track_object",
+    "description": "Lock onto any object in view (a mug, a phone, a pet) and keep it in view: the servo head and zoom follow it instead of the user's face. Pass target 'stop' to go back to following faces.",
+    "parameters": {
+      "target": {
+        "type": "string",
+        "description": "What to track, e.g. 'the red mug', or 'stop'."
+      }
+    },
+    "required": [
+      "target"
+    ]
   }
 ]

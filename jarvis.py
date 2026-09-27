@@ -4,15 +4,19 @@ ElevenLabs Conversational AI (voice + tool calls) + Gemini (vision) + OpenCV (ca
 
 Window keys:
   Clickable control bar at the bottom. Mouse wheel zooms toward the cursor, drag pans when zoomed.
-  SPACE mic mute / wake   A autonomy   S servo test   C follow me (auto-framing)   F fullscreen   M fit/fill   T pin on top
+  Right-drag a box around anything to track it (right-click to stop). Gestures: thumbs up photo, peace record,
+  open palm mic, thumbs down reset.
+  SPACE mic mute / wake   A autonomy   G gestures   S servo test   C follow me (auto-framing)   F fullscreen   M fit/fill   T pin on top
   P photo   R record   + / - zoom   arrows pan   0 reset zoom   H help   ESC quit
 The window can be dragged to any size or shape; the picture adapts.
 """
-import os, re, sys, json, time, html, threading, subprocess, webbrowser, datetime, pathlib, urllib.parse
+import os, re, sys, json, time, html, threading, subprocess, webbrowser, datetime, pathlib, urllib.parse, urllib.request
 import warnings; warnings.filterwarnings("ignore")
 import cv2
 import numpy as np
-import google.generativeai as genai
+from google import genai
+from google.genai import types as gtypes
+from collections import deque
 from dotenv import load_dotenv
 from elevenlabs import ElevenLabs
 from elevenlabs.conversational_ai.conversation import Conversation, ClientTools
@@ -33,14 +37,18 @@ SERVO_PORT    = os.getenv("SERVO_PORT", "auto")                # "auto" finds th
 SERVO_KP      = float(os.getenv("SERVO_KP", "10"))             # tracking strength (degrees per update at full-frame error)
 PAN_DIR       = -1 if os.getenv("SERVO_INVERT_PAN", "0") == "1" else 1    # flip if it turns away from you
 TILT_DIR      = -1 if os.getenv("SERVO_INVERT_TILT", "0") == "1" else 1
+GEMINI_FALLBACKS = [m.strip() for m in os.getenv("GEMINI_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash").split(",") if m.strip()]
+AUTO_BUDGET   = int(os.getenv("AUTO_BUDGET", "25"))            # max background Gemini calls per run (free tier is ~20/day/model)
+GESTURES      = os.getenv("GESTURES", "1") == "1"              # hand gestures (local models, no API calls)
 AUTONOMY      = os.getenv("AUTONOMY", "aware")                # off, aware (silent awareness), proactive (speaks up on its own)
-GLANCE_EVERY  = float(os.getenv("GLANCE_EVERY", "30"))        # seconds between background scene checks while you're in frame
+GLANCE_EVERY  = float(os.getenv("GLANCE_EVERY", "90"))        # min seconds between background scene checks (skipped if nothing changed)
 SPEAK_GAP     = float(os.getenv("SPEAK_GAP", "120"))          # minimum seconds between unprompted remarks
 WIN           = "JARVIS"
 IS_WIN        = sys.platform.startswith("win")
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-vision = genai.GenerativeModel(VISION_MODEL)
+if not os.getenv("GEMINI_API_KEY"): sys.exit("GEMINI_API_KEY is missing from .env")
+if not os.getenv("ELEVENLABS_API_KEY"): sys.exit("ELEVENLABS_API_KEY is missing from .env")
+GEMINI = genai.Client(api_key=os.getenv("GEMINI_API_KEY"), http_options=gtypes.HttpOptions(timeout=30000))
 client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
 BASE    = pathlib.Path(__file__).resolve().parent
@@ -77,7 +85,12 @@ class State:
     speaking_until = 0.0  # when JARVIS's queued audio finishes playing
     voice_on = False; want_voice = True
     last_user_t = 0.0     # last time the user spoke
-    disp_map = (0, 0, 1, 1); buttons = []; bar_top = 10000; drag = None
+    disp_map = (0, 0, 1, 1); buttons = []; bar_top = 10000; drag = None; rdrag = None
+    face_target = None    # smoothed box of the person being tracked
+    hands = []            # [(gesture, box_norm, landmarks_norm)]
+    countdown_until = 0.0
+    target = None         # smoothed box of the person being tracked
+    close_hits = 0
     quit = False
 
 S = State()
@@ -136,24 +149,61 @@ def _jpeg(img, max_side=1280):
     if s < 1: img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
 
-def gemini(prompt, img=None, max_tokens=1024, json_mode=False):
-    parts = [prompt] + ([{"mime_type": "image/jpeg", "data": _jpeg(img)}] if img is not None else [])
-    cfg = {"max_output_tokens": max_tokens}          # thinking tokens count against this, keep it roomy
-    if json_mode: cfg["response_mime_type"] = "application/json"
-    r = vision.generate_content(parts, generation_config=cfg, request_options={"timeout": 30})
-    try: return r.text.strip()
-    except Exception: return ""
+class QuotaExhausted(Exception):
+    pass
+
+MODEL_CHAIN = [VISION_MODEL] + [m for m in GEMINI_FALLBACKS if m != VISION_MODEL]
+_blocked = {}                       # model name -> blocked-until timestamp
+GEM = {"calls": 0, "background": 0}
+
+def check_models():
+    """Drop fallback models this API key can't use (listing models doesn't cost quota)."""
+    global MODEL_CHAIN
+    try:
+        ok = {m.name.split("/")[-1] for m in GEMINI.models.list() if "generateContent" in (m.supported_actions or [])}
+        chain = [m for m in MODEL_CHAIN if m in ok]
+        if VISION_MODEL not in ok: print(f"Warning: {VISION_MODEL} isn't available to this key")
+        MODEL_CHAIN = chain or MODEL_CHAIN
+    except Exception as e:
+        print(f"Couldn't list Gemini models ({e})")
+    print("Vision models:", " -> ".join(MODEL_CHAIN))
+
+def vision_available():
+    return any(_blocked.get(m, 0) <= time.time() for m in MODEL_CHAIN)
+
+def gemini(prompt, img=None, max_tokens=1024, json_mode=False, images=None):
+    jpg = lambda im, side=1280: gtypes.Part.from_bytes(data=_jpeg(im, side), mime_type="image/jpeg")
+    parts = [prompt] + ([jpg(img)] if img is not None else [])
+    for label, im in images or []:
+        parts += [label, jpg(im, 768)]
+    cfg = gtypes.GenerateContentConfig(max_output_tokens=max_tokens,       # thinking tokens count against this, keep it roomy
+                                       response_mime_type="application/json" if json_mode else None)
+    for name in MODEL_CHAIN:
+        if _blocked.get(name, 0) > time.time(): continue
+        try:
+            r = GEMINI.models.generate_content(model=name, contents=parts, config=cfg)
+            GEM["calls"] += 1
+            return (r.text or "").strip()
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "quota" in msg.lower() or "exhausted" in msg.lower():
+                daily = "PerDay" in msg
+                m = re.search(r"retry(?:Delay)?(?: in)?['\"]?[:\s]*['\"]?([\d.]+)s", msg)
+                _blocked[name] = time.time() + (6 * 3600 if daily else (float(m.group(1)) + 1 if m else 60))
+                print(f"[gemini] {name}: {'daily quota used up' if daily else 'rate limited'}, trying the next model")
+                continue
+            if "404" in msg or "not found" in msg.lower() or "not supported" in msg.lower():
+                _blocked[name] = time.time() + 86400
+                print(f"[gemini] {name} unavailable, trying the next model"); continue
+            raise
+    set_status("Gemini quota used up: vision paused", 10)
+    raise QuotaExhausted("My vision allowance from Google is used up for now, so I can't see at the moment. "
+                         "Turning on billing for the Gemini key fixes it.")
 
 def gemini_json(prompt, img, max_tokens=1024):
     txt = gemini(prompt, img, max_tokens, json_mode=True)
     m = re.search(r"\{.*\}", txt, re.S)
     return json.loads(m.group(0)) if m else {}
-
-def caption_async(entry, img):
-    def run():
-        try: entry["caption"] = gemini("Describe this photo in one factual sentence: main subject, condition, any readable text.", img, 512)
-        except Exception as e: entry["caption"] = f"(caption failed: {e})"
-    threading.Thread(target=run, daemon=True).start()
 
 # ------------------------------------------------------------------ tools (called by the ElevenLabs agent)
 TOOLS = {}
@@ -163,6 +213,7 @@ def tool(fn):
         shown = {k: v for k, v in params.items() if k != "tool_call_id"}
         print(f">>> TOOL {fn.__name__} {shown}")
         try: out = fn(params)
+        except QuotaExhausted as e: out = str(e)
         except Exception as e: out = f"{fn.__name__} failed: {e}"
         print(f"<<< {fn.__name__}: {str(out)[:200]}")
         return str(out)
@@ -191,7 +242,7 @@ def take_photo(p):
     cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
     S.flash_until = time.time() + 0.25
     set_status(f"Saved {path.name}")
-    caption_async(add_log("photo", file=path.name, label=label, caption=None), frame)
+    add_log("photo", file=path.name, label=label, caption=None)     # captioned in one batch at report time
     return f"Photo saved as {path.name}."
 
 def _start_recording(max_seconds=None):
@@ -354,10 +405,12 @@ def open_item(p):
 def make_report(p):
     title = arg(p, "title", "JARVIS Session Report")
     purpose = arg(p, "purpose", "general record")
-    deadline = time.time() + 10                       # let pending photo captions finish
-    while time.time() < deadline and any(e["kind"] == "photo" and e.get("caption") is None for e in S.log):
-        time.sleep(0.5)
     if not S.log and not NOTES.exists(): return "There's nothing in this session to report yet."
+    photos = [e for e in S.log if e["kind"] == "photo" and e.get("caption") is None][-12:]
+    images = []
+    for e in photos:
+        im = cv2.imread(str(SESSION / e["file"]))
+        if im is not None: images.append((f"Photo {e['file']}:", im))
     facts = []
     for e in S.log:
         if e["kind"] == "photo": facts.append(f"[{e['time']}] Photo {e['file']} ({e.get('label') or 'no label'}): {e.get('caption') or ''}")
@@ -366,10 +419,15 @@ def make_report(p):
         else: facts.append(f"[{e['time']}] {e['kind']}: {e.get('text', '')[:500]}")
     notes = NOTES.read_text(encoding="utf-8") if NOTES.exists() else ""
     set_status("Writing report...", 8)
-    summary = gemini(f"Write a clear, factual summary for a report whose purpose is: {purpose}. "
-                     "Use short paragraphs and, if useful, a short bulleted list of key findings or next steps. "
-                     "Only use the information below; do not invent details. Plain text, no markdown headers.\n\n"
-                     + "\n".join(facts) + "\n\nNotes:\n" + notes, None, 2048) or "(summary unavailable)"
+    txt = gemini(f"You are writing a report whose purpose is: {purpose}. The photos are attached, each labeled with its file name. "
+                 'Reply only with JSON: {"captions": {"<file name>": "one factual sentence: subject, condition, readable text"}, '
+                 '"summary": "clear factual summary in short paragraphs, with a short list of key findings or next steps if useful"}. '
+                 "Only use the photos and information below; do not invent details. Plain text inside the JSON, no markdown headers.\n\n"
+                 + "\n".join(facts) + "\n\nNotes:\n" + notes, None, 4096, json_mode=True, images=images)
+    m = re.search(r"\{.*\}", txt or "", re.S)
+    res = json.loads(m.group(0)) if m else {}
+    for e in photos: e["caption"] = (res.get("captions") or {}).get(e["file"], "")
+    summary = res.get("summary") or "(summary unavailable)"
     esc = html.escape
     cards = []
     for e in S.log:
@@ -403,13 +461,40 @@ def notify_agent(msg):
             try: fn(msg); return
             except Exception as e: print(f"[alert] {name} failed: {e}")
 
+PERSON_WORDS = ("person", "someone", "somebody", "anyone", "anybody", "people", "face", "human", "visitor",
+                "man", "woman", "guy", "girl", "boy", "kid", "roommate", "friend")
+
+def _thumb(frame):
+    return cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 48), interpolation=cv2.INTER_AREA).astype(np.int16)
+
+def scene_changed(a, b, thresh=6.0):
+    return a is None or b is None or float(np.abs(a - b).mean()) > thresh
+
 def watch_loop(target, token):
+    person = any(w in target.lower() for w in PERSON_WORDS)
+    baseline = len(S.faces)                                   # "someone walks in" while you're sitting there = one more face
+    last_thumb, last_check = None, 0.0
     while S.watch_token == token and not S.quit:
         frame = current_raw()
-        if frame is not None:
+        if person:                                            # free: uses the local face detector, no API calls
+            if len(S.faces) > baseline:
+                S.watch_target = None
+                name = take_photo({"label": f"watch {target}"})
+                add_log("note", text=f"Watch alert: {target} appeared.")
+                notify_agent(f"[Camera alert] {target} just appeared ({len(S.faces)} people in view now). {name} "
+                             "Tell the user in one short sentence.")
+                return
+            baseline = min(baseline, len(S.faces))
+            time.sleep(0.3); continue
+        thumb = _thumb(frame) if frame is not None else None
+        if frame is not None and scene_changed(last_thumb, thumb) and time.time() - last_check > max(WATCH_EVERY, 10):
+            last_thumb, last_check = thumb, time.time()
             try:
                 res = gemini_json(f'Is {target} clearly visible in this image? Reply only with JSON: '
                                   '{"present": true or false, "detail": "short description"}', frame, 512)
+            except QuotaExhausted:
+                notify_agent("[Camera alert] The vision quota ran out, so the watch has stopped. Tell the user in one sentence.")
+                S.watch_target = None; return
             except Exception as e:
                 res = {}; print(f"[watch] {e}")
             if res.get("present") and S.watch_token == token:
@@ -419,7 +504,7 @@ def watch_loop(target, token):
                 notify_agent(f"[Camera alert] {target} just appeared: {res.get('detail', '')}. {name} "
                              "Tell the user in one short sentence.")
                 return
-        time.sleep(WATCH_EVERY)
+        time.sleep(1)
 
 @tool
 def watch_for(p):
@@ -459,7 +544,7 @@ class A:
     present = False; present_since = 0.0; absent_since = 0.0
     people = 0; people_since = 0.0
     last_think = 0.0; think_asap = False; last_scene = ""
-    last_spoke = 0.0; last_ping = 0.0
+    last_spoke = 0.0; last_ping = 0.0; last_thumb = None
     events = []           # (time, text)
     busy = False
 
@@ -511,6 +596,8 @@ def think(triggered_by_event):
             f'Previous observation: "{A.last_scene or "none"}"\nRecent events: {events}\n{talk}\n{sitting}\n'
             'Reply only with JSON: {"summary": "one sentence: who is there, what they are doing or holding", '
             '"speak": true or false, "say": "if speak, the short natural sentence or question JARVIS would say"}', frame)
+    except QuotaExhausted:
+        print("[think] vision quota used up, autonomy pausing"); return
     except Exception as e:
         print(f"[think] {e}"); return
     summary = (res.get("summary") or "").strip()
@@ -555,9 +642,19 @@ def autonomy_loop():
             A.last_ping = now
             try: convo.register_user_activity()
             except Exception: pass
+        if GEM["background"] >= AUTO_BUDGET or not vision_available():
+            A.think_asap = False; continue                  # save the remaining quota for things you ask for
         due = A.present and now - A.last_think > GLANCE_EVERY
+        if due and not A.think_asap:
+            frame = current_raw()
+            thumb = _thumb(frame) if frame is not None else None
+            if not scene_changed(A.last_thumb, thumb, 8.0):
+                A.last_think = now; continue                # nothing new to look at: skip the call
         if (A.think_asap or due) and not A.busy and now > S.speaking_until + 2 and now - S.last_user_t > 6:
             ev, A.think_asap, A.last_think = A.think_asap, False, now
+            frame = current_raw()
+            A.last_thumb = _thumb(frame) if frame is not None else None
+            GEM["background"] += 1
             _think_async(ev)
 
 @tool
@@ -569,6 +666,61 @@ def set_autonomy(p):
     return {"off": "Autonomy off. I'll only act when asked.",
             "aware": "I'll keep an eye on things quietly and only speak when you talk to me.",
             "proactive": "I'll speak up on my own when something worth mentioning happens."}[lvl]
+
+# ------------------------------------------------------------------ hand gestures (OpenCV Zoo MediaPipe hand models)
+def _photo_countdown():
+    S.countdown_until = time.time() + 3
+    time.sleep(3)
+    take_photo({"label": "gesture"})
+
+def _gesture_record():
+    (_stop_recording if S.writer else _start_recording)()
+
+GESTURE_ACTIONS = {                      # gesture -> (label shown on screen, action)
+    "ThumbsUp":   ("photo in 3", lambda: threading.Thread(target=_photo_countdown, daemon=True).start()),
+    "Two":        ("record", _gesture_record),
+    "Five":       ("mic", lambda: toggle_mic()),
+    "ThumbsDown": ("reset", lambda: (stop_tracking("Reset"), zoom({"level": 1}))),
+}
+HANDS = None
+
+def load_hand_models():
+    global HANDS
+    if not GESTURES: return
+    try:
+        sys.path.insert(0, str(BASE))
+        from zoo.gestures import HandGestures
+        HANDS = HandGestures(zoo_model("palm_detection_mediapipe", "palm_detection_mediapipe_2023feb.onnx"),
+                             zoo_model("handpose_estimation_mediapipe", "handpose_estimation_mediapipe_2023feb.onnx"))
+        print("Hand gestures: on (thumbs up = photo, peace = record, open palm = mic, thumbs down = reset)")
+    except Exception as e:
+        HANDS = None; print(f"Hand gestures off: {e}")
+
+def hands_loop():
+    """Runs beside the camera loop (~8 checks/sec) so gesture detection never slows the video."""
+    hist, fired = deque(maxlen=6), {}
+    while not S.quit:
+        t0 = time.time()
+        frame = current_raw()
+        if HANDS is None or frame is None:
+            time.sleep(0.5); continue
+        try: res = HANDS.detect(frame)
+        except Exception as e: print(f"[hands] {e}"); time.sleep(1); continue
+        h, w = frame.shape[:2]
+        S.hands = [(g, (b[0] / w, b[1] / h, (b[2] - b[0]) / w, (b[3] - b[1]) / h), [(x / w, y / h) for x, y in lm])
+                   for g, b, lm, _ in res]
+        g = next((r[0] for r in res if r[0] in GESTURE_ACTIONS), None)
+        hist.append(g)
+        now = time.time()
+        if g and hist.count(g) >= 4 and now - fired.get(g, 0) > 3:     # held ~0.5s, then 3s cooldown
+            fired[g] = now; hist.clear()
+            label, action = GESTURE_ACTIONS[g]
+            print(f"[gesture] {g} -> {label}")
+            set_status(f"Gesture: {label}")
+            ctx(f"[Gesture] The user made a {g} gesture ({label}).")
+            try: action()
+            except Exception as e: print(f"[gesture] {e}")
+        time.sleep(max(0.0, 0.12 - (time.time() - t0)))
 
 # ------------------------------------------------------------------ servos (pan/tilt head)
 class Servo:
@@ -588,9 +740,12 @@ class Servo:
              if any(k in f"{p.description} {p.manufacturer}".lower() for k in ("arduino", "ch340", "usb serial", "usb-serial", "cp210"))]
         for port in ports:
             try:
-                cls.ser = serial.Serial(port, 115200, timeout=0.1); cls.port = port
-                time.sleep(2)                                    # opening the port resets the Arduino
-                print(f"Servos connected on {port}: {cls.ser.read(64).decode(errors='ignore').strip() or '(no banner)'}")
+                cls.ser = serial.Serial(port, 115200, timeout=0.2); cls.port = port
+                banner, t0 = b"", time.time()                    # opening the port resets the Arduino (~2-3s incl. wiggle)
+                while time.time() - t0 < 4 and b"ready" not in banner.lower():
+                    banner += cls.ser.read(64)
+                txt = banner.decode(errors="ignore").strip()
+                print(f"Servos connected on {port}: " + (txt if txt else "no reply (old firmware? upload jarvis_servo.ino)"))
                 cls.send(force=True); return
             except Exception as e:
                 print(f"Servo port {port}: {e}")
@@ -610,8 +765,8 @@ class Servo:
     def track(cls, now):
         """Closed-loop: nudge the head so the main face moves toward the center of the frame."""
         if cls.ser is None or now < cls.manual_until: return
-        if S.faces and now - S.last_face_t < 0.5:
-            x, y, w, h = S.faces[0]
+        if S.target is not None:
+            x, y, w, h = S.target
             ex, ey = (x + w / 2) - 0.5, (y + h / 2) - 0.45
             if abs(ex) > 0.06: cls.pan -= PAN_DIR * max(-4, min(4, ex * SERVO_KP))
             if abs(ey) > 0.08: cls.tilt += TILT_DIR * max(-3, min(3, ey * SERVO_KP))
@@ -635,20 +790,134 @@ def turn_camera(p):
     return f"Turned {d}."
 
 # ------------------------------------------------------------------ camera + window
-_face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# Face detection: YuNet (small pretrained neural net that ships with OpenCV's model zoo) handles tilted heads,
+# dim rooms, and faces further away far better than the old Haar cascade. Falls back to Haar if the model is missing.
+try:    # Haar cascades were moved out of the main package in OpenCV 5; only used if YuNet can't load
+    _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+except AttributeError:
+    _face_cascade = None
+ZOO_URL = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+MODELS = BASE / "models"
+_yunet = None
+
+def zoo_model(subdir, fname):
+    """Path to an OpenCV Zoo model, downloading it on first use."""
+    path = MODELS / fname
+    if not path.exists():
+        print(f"Downloading {fname}...")
+        MODELS.mkdir(exist_ok=True)
+        urllib.request.urlretrieve(ZOO_URL + f"{subdir}/{fname}", path)
+    return path
+
+def load_face_model():
+    global _yunet
+    for fname in ("face_detection_yunet_2026may.onnx", "face_detection_yunet_2023mar.onnx"):
+        try:
+            _yunet = cv2.FaceDetectorYN.create(str(zoo_model("face_detection_yunet", fname)), "", (320, 320), 0.6, 0.3, 50)
+            print(f"Face detector: YuNet ({fname})"); return
+        except Exception as e:
+            print(f"YuNet {fname} failed: {e}")
+    _yunet = None
+    print("Face detector: Haar fallback")
 
 def detect_faces(frame):
-    """Same detector settings as robot.py; returns normalized boxes, biggest first."""
+    """Returns normalized (x, y, w, h) boxes, biggest first."""
     h, w = frame.shape[:2]
-    boxes = _face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80, 80))
-    out = [(x / w, y / h, bw / w, bh / h) for x, y, bw, bh in boxes]
+    if _yunet is not None:
+        _yunet.setInputSize((w, h))
+        _, res = _yunet.detect(frame)
+        boxes = [] if res is None else [tuple(float(v) for v in r[:4]) for r in res]
+    elif _face_cascade is not None:
+        boxes = _face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80, 80))
+    else:
+        boxes = []
+    out = []
+    for x, y, bw, bh in boxes:
+        x, y = max(0.0, x), max(0.0, y)
+        out.append((x / w, y / h, min(bw, w - x) / w, min(bh, h - y) / h))
     return sorted(out, key=lambda b: -b[2] * b[3])
+
+def update_target(faces, now):
+    """Pick who to track and smooth their box. Sticks with the same person instead of jumping to whoever is biggest."""
+    if not faces:
+        if now - S.last_face_t > 0.6: S.face_target = None  # brief misses (blinks, motion blur) keep the lock
+        return
+    S.last_face_t = now
+    if S.face_target is None:
+        S.face_target = faces[0]; return
+    tx, ty, tw, th = S.face_target
+    tcx, tcy = tx + tw / 2, ty + th / 2
+    def score(b):                                           # prefer close to the current target, then size
+        d = ((b[0] + b[2] / 2 - tcx) ** 2 + (b[1] + b[3] / 2 - tcy) ** 2) ** 0.5
+        return d - 0.5 * b[2] * b[3]
+    best = min(faces, key=score)
+    if ((best[0] + best[2] / 2 - tcx) ** 2 + (best[1] + best[3] / 2 - tcy) ** 2) ** 0.5 > 0.35 and best is not faces[0]:
+        best = faces[0]                                     # target clearly gone: take the biggest face
+    a = 0.45                                                # smoothing: higher = snappier, lower = steadier
+    S.face_target = tuple(o * (1 - a) + n * a for o, n in zip(S.face_target, best))
+
+# ------------------------------------------------------------------ object tracking (VitTrack, OpenCV Zoo)
+class Obj:
+    tracker = None; label = ""; box = None; lost = 0; pending = None; score = 0.0
+
+def start_tracking(box, label):
+    """box: normalized (x, y, w, h) in the raw frame. The tracker itself is created on the camera thread."""
+    Obj.pending = (box, label)
+
+def stop_tracking(reason=""):
+    if Obj.tracker is None and Obj.pending is None: return
+    Obj.tracker, Obj.box, Obj.pending = None, None, None
+    if reason: set_status(reason)
+
+def update_object(frame):
+    h, w = frame.shape[:2]
+    if Obj.pending:
+        (x, y, bw, bh), Obj.label = Obj.pending; Obj.pending = None
+        try:
+            p = cv2.TrackerVit_Params(); p.net = str(zoo_model("object_tracking_vittrack", "object_tracking_vittrack_2023sep.onnx"))
+            Obj.tracker = cv2.TrackerVit_create(p)
+            Obj.tracker.init(frame, (int(x * w), int(y * h), max(8, int(bw * w)), max(8, int(bh * h))))
+            Obj.box, Obj.lost = (x, y, bw, bh), 0
+            set_status(f"Tracking {Obj.label}")
+        except Exception as e:
+            Obj.tracker = None; set_status(f"Tracker failed: {e}")
+        return
+    if Obj.tracker is None: return
+    ok, b = Obj.tracker.update(frame)
+    Obj.score = float(Obj.tracker.getTrackingScore())
+    if ok and Obj.score >= 0.3:
+        Obj.box, Obj.lost = (b[0] / w, b[1] / h, b[2] / w, b[3] / h), 0
+    else:
+        Obj.lost += 1
+        if Obj.lost > 20:                                   # ~0.7s of low confidence: it's gone
+            label = Obj.label
+            stop_tracking(f"Lost the {label}")
+            ctx(f"[Presence] Lost track of the {label}.")
+
+@tool
+def track_object(p):
+    target = str(arg(p, "target", "")).strip()
+    if not target or target.lower() in ("stop", "none", "nothing", "cancel", "me", "my face"):
+        stop_tracking("Back to tracking faces")
+        return "Stopped tracking the object. Back to following faces."
+    frame = current_raw()
+    if frame is None: return "The camera isn't giving me a picture right now."
+    set_status(f"Finding {target}...", 4)
+    res = gemini_json(f'Find "{target}" in this image. Reply only with JSON: '
+                      '{"found": true or false, "box_2d": [ymin, xmin, ymax, xmax]} with coordinates normalized 0 to 1000.', frame)
+    box = res.get("box_2d")
+    if not res.get("found") or not box or len(box) != 4:
+        return f"I can't find {target} in view."
+    y0, x0, y1, x1 = [float(v) / 1000 for v in box]
+    start_tracking((x0, y0, max(x1 - x0, 0.02), max(y1 - y0, 0.02)), target)
+    if Servo.ser is None: S.follow = True                  # no servo head: follow it with digital zoom instead
+    return f"Locked on to {target}. I'll keep it in view."
 
 def update_follow(now):
     """Digital auto-framing (like Center Stage): keep the main face centered and framed."""
     if not S.follow: return
-    if S.faces:
-        x, y, w, h = S.faces[0]
+    if S.target is not None:
+        x, y, w, h = S.target
         tx, ty = x + w / 2, y + h * 0.9                 # a bit below the face so shoulders are in frame
         tz = max(1.0, min(3.0, 0.28 / max(h, 0.01)))    # face fills ~28% of the view height
         if abs(tx - S.cx_t) > 0.02: S.cx_t += (tx - S.cx_t) * 0.15
@@ -676,13 +945,41 @@ def draw_faces(img):
     """Green boxes, mapped from raw-frame coords into the zoomed view."""
     h, w = img.shape[:2]
     cx0, cy0, cw, ch = S.crop
-    for i, (x, y, bw, bh) in enumerate(S.faces):
+    ft = S.face_target if Obj.box is None else None
+    boxes = ([ft] if ft else []) + [f for f in S.faces if ft is None or abs(f[0] - ft[0]) + abs(f[1] - ft[1]) > 0.08]
+    for i, (x, y, bw, bh) in enumerate(boxes):
         x1, y1 = int((x - cx0) / cw * w), int((y - cy0) / ch * h)
         x2, y2 = int((x + bw - cx0) / cw * w), int((y + bh - cy0) / ch * h)
         if x2 < 0 or y2 < 0 or x1 > w or y1 > h: continue
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        if S.follow and i == 0: put(img, "TRACKING", (x1, max(18, y1 - 8)), 0.55, (0, 255, 0), 1)
+        tracked = i == 0 and ft is not None
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0) if tracked else (0, 160, 0), 2 if tracked else 1)
+        if tracked and (S.follow or Servo.ser): put(img, "TRACKING", (x1, max(18, y1 - 8)), 0.55, (0, 255, 0), 1)
+    def to_view(nx, ny): return int((nx - cx0) / cw * w), int((ny - cy0) / ch * h)
+    if Obj.box is not None:                                   # tracked object: orange
+        x, y, bw, bh = Obj.box
+        p1, p2 = to_view(x, y), to_view(x + bw, y + bh)
+        cv2.rectangle(img, p1, p2, (0, 165, 255), 2)
+        put(img, f"TRACKING {Obj.label.upper()}", (p1[0], max(18, p1[1] - 8)), 0.55, (0, 165, 255), 1)
+    for g, (x, y, bw, bh), lm in S.hands:                     # hands: skeleton + gesture name
+        pts = [to_view(px, py) for px, py in lm]
+        for a, b in ((0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(0,17),(17,18),(18,19),(19,20)):
+            cv2.line(img, pts[a], pts[b], (255, 200, 80), 1, cv2.LINE_AA)
+        if g in GESTURE_ACTIONS:
+            put(img, GESTURE_ACTIONS[g][0], (pts[0][0] - 30, pts[0][1] + 22), 0.55, (255, 200, 80), 1)
+    if S.rdrag:                                               # right-drag selection box
+        (sx, sy), (ex, ey) = S.rdrag
+        a, b = screen_to_view(sx, sy, w, h), screen_to_view(ex, ey, w, h)
+        cv2.rectangle(img, a, b, (0, 165, 255), 1)
+    left = S.countdown_until - time.time()                    # thumbs-up photo countdown
+    if left > 0:
+        txt = str(int(left) + 1)
+        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 4, 8)
+        put(img, txt, ((w - tw) // 2, (h + th) // 2), 4, (255, 255, 255), 8)
     return img
+
+def screen_to_view(mx, my, w, h):
+    x0, y0, nw, nh = S.disp_map
+    return int((mx - x0) / max(nw, 1) * w), int((my - y0) / max(nh, 1) * h)
 
 def fit_to_window(img, ww, wh, mode):
     ih, iw = img.shape[:2]
@@ -729,7 +1026,7 @@ def draw_hud(img):
     now = time.time()
     if now < S.flash_until:
         cv2.addWeighted(img, 0.4, np.full_like(img, 255), 0.6, 0, img)
-    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}" + (f"  SERVO:{Servo.port}" if Servo.ser else "")
+    top = f"JARVIS  {S.zoom_t:.1f}x  {S.fit_mode.upper()}  {S.fps:.0f}fps" + ("  FOLLOW" if S.follow else "") + f"  AUTO:{A.level.upper()}" + (f"  SERVO:{Servo.port}" if Servo.ser else "") + f"  AI:{GEM['calls']}"
     put(img, top, (int(16 * sc), lh), sc, (120, 230, 255), 2)
     vl, vc = voice_label()
     put(img, vl, (int(16 * sc), lh * 2), sc * 0.7, vc, 2)
@@ -816,6 +1113,16 @@ def on_mouse(ev, mx, my, flags, _):
         S.cy_t = min(max(cy - (my - sy) / max(nh, 1) / S.zoom_t, 0), 1)
     elif ev == cv2.EVENT_LBUTTONUP:
         S.drag = None
+    elif ev == cv2.EVENT_RBUTTONDOWN:
+        S.rdrag = ((mx, my), (mx, my))
+    elif ev == cv2.EVENT_MOUSEMOVE and S.rdrag and (flags & cv2.EVENT_FLAG_RBUTTON):
+        S.rdrag = (S.rdrag[0], (mx, my))
+    elif ev == cv2.EVENT_RBUTTONUP and S.rdrag:
+        (sx, sy), _ = S.rdrag; S.rdrag = None
+        if abs(mx - sx) < 8 or abs(my - sy) < 8:
+            stop_tracking("Back to tracking faces"); return   # right-click without dragging = stop
+        ax, ay = screen_to_raw(min(sx, mx), min(sy, my)); bx, by = screen_to_raw(max(sx, mx), max(sy, my))
+        start_tracking((ax, ay, bx - ax, by - ay), "selection")
     elif ev == cv2.EVENT_MOUSEWHEEL:
         S.follow = False
         up = flags > 0                                        # wheel delta lives in the high bits; sign = direction
@@ -860,10 +1167,14 @@ def servo_test():
 def handle_key(k):
     if k == -1: return
     c = chr(k & 0xFF).lower() if k < 256 else ""
-    if k == 27: shutdown()
+    if k == 27: print("ESC pressed."); shutdown()
     elif c == " ": toggle_mic()
     elif c == "c": follow_me({"on": not S.follow})
     elif c == "s": threading.Thread(target=servo_test, daemon=True).start()
+    elif c == "g":
+        global HANDS
+        if HANDS: HANDS, S.hands = None, []; set_status("Gestures off")
+        else: load_hand_models(); set_status("Gestures on" if HANDS else "Gestures unavailable")
     elif c == "a": set_autonomy({"level": {"off": "aware", "aware": "proactive"}.get(A.level, "off")})
     elif c == "f": S.window_cmds.append(("toggle_fullscreen", None))
     elif c == "m": S.fit_mode = "fill" if S.fit_mode == "fit" else "fit"
@@ -924,7 +1235,9 @@ def camera_loop():
             print(f"Running at ~{S.fps:.0f} fps" + ("  (slow: try CAM_RES=native or CAM_BACKEND=dshow in .env)" if S.fps < 15 else ""))
         if ok:
             S.faces = detect_faces(frame)
-            if S.faces: S.last_face_t = now
+            update_target(S.faces, now)
+            update_object(frame)
+        S.target = Obj.box if Obj.box is not None else S.face_target
         Servo.track(now)
         update_follow(now)
         view = apply_zoom(frame)
@@ -939,9 +1252,11 @@ def camera_loop():
         disp = draw_faces(view.copy())
         cv2.imshow(WIN, draw_hud(fit_to_window(disp, ww, wh, S.fit_mode)))
         handle_key(cv2.waitKeyEx(1))
-        try:
-            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1: shutdown()
-        except Exception: shutdown()
+        try: closed = cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1
+        except Exception: closed = True
+        S.close_hits = S.close_hits + 1 if closed else 0
+        if S.close_hits >= 5:
+            print("Window closed."); shutdown()
 
 def shutdown():
     if S.quit: return
@@ -983,8 +1298,12 @@ def on_user(t):   print("You:", t);    S.cap_user = (t, time.time()); S.last_use
 
 def main():
     global convo
+    check_models()
+    load_face_model()
+    load_hand_models()
     Servo.connect()
     threading.Thread(target=camera_loop, daemon=True).start()
+    threading.Thread(target=hands_loop, daemon=True).start()
     threading.Thread(target=autonomy_loop, daemon=True).start()
     for _ in range(50):
         if S.view is not None: break
