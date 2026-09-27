@@ -45,6 +45,8 @@ measurement, identity association, or persistence is implemented.
   uses separate `sounddevice` PCM playback, sentence gaps of 350 ms and a 600 ms
   trailing pause. The static notice is pre-synthesized on a bounded background
   job and held in RAM. Actual model access/audio latency must be checked by a human.
+  Both the notice and the default remark model are `eleven_flash_v2_5`, ElevenLabs'
+  lowest-cost tier, per the team's decision to keep cost down for now.
 - The design says both 1.5 s and 2 s for opt-out. This implementation consistently
   uses the more conservative **2 s after the notice ends**.
 - Bounded daemon jobs/semaphores replace `ThreadPoolExecutor`. At most three

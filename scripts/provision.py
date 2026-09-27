@@ -109,7 +109,9 @@ def main():
         raise SystemExit(
             "Set MEMORY_ENABLED=true, ENCRYPTION_KEY and MONGODB_ATLAS_URI first"
         )
-    connection = ConnectionManager(config)
+    # Provisioning issues collection/validator/index-management commands that
+    # can legitimately take longer than the runtime's 2s operation budget.
+    connection = ConnectionManager(config, timeout_ms=20000)
     try:
         provision(
             connection.database,
