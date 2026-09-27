@@ -1,5 +1,18 @@
-﻿.env
+.env
+.env.*
+!.env.example
+.venv/
 venv/
 __pycache__/
-out_*.mp3
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+*.mp3
 /captures
+data/
+# models/ holds tracked ONNX files and servo calibration; do not ignore it.
+*.sqlite3*
+
+# Keep the source-controlled regression fixtures, not runtime data.
+!tests/data/
+!tests/data/remarks_corpus.json

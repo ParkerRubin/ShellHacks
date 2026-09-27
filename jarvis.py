@@ -24,6 +24,10 @@ from dotenv import load_dotenv
 from elevenlabs import ElevenLabs
 from elevenlabs.conversational_ai.conversation import Conversation, ClientTools
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
+# The jarvis/ package (memory, positivity) sits next to this script; `import jarvis` resolves to it.
+from jarvis.memory import NullMemory, build_memory
+from jarvis.positivity import NullPositivity, build_positivity
+from jarvis.runtime import close_and_exit
 
 # ------------------------------------------------------------------ config
 load_dotenv()
@@ -114,6 +118,8 @@ class State:
 
 S = State()
 convo = None
+MEMORY = NullMemory()          # replaced in main(): face recognition + conversation memory (needs ENCRYPTION_KEY)
+POSITIVITY = NullPositivity()  # replaced in main(): opt-in encouragement (POSITIVITY_ENABLED=true)
 
 def set_status(msg, secs=3.0, log=True):
     S.status, S.status_until = msg, time.time() + secs
@@ -254,7 +260,20 @@ def look(p):
     prompt += f"Question: {q}" if q else "Describe what is in front of the camera, focusing on the main subject."
     ans = gemini(prompt, frame) or "I couldn't make that out clearly."
     add_log("look", text=ans, question=q or "What do you see?")
+    MEMORY.ingestor.on_gemini(ans)
     return ans
+
+@tool
+def recall(p):
+    return MEMORY.retriever.recall(arg(p, "query", ""), MEMORY.presence.user_id) or "Nothing relevant remembered yet."
+
+@tool
+def remember_me(p):
+    return MEMORY.consent.remember(arg(p, "confirmed", False), arg(p, "name"))   # only a real True counts as consent
+
+@tool
+def forget_me(p):
+    return MEMORY.consent.forget()
 
 @tool
 def take_photo(p):
@@ -1553,6 +1572,7 @@ def camera_loop():
             S.faces = detect_faces(frame)
             update_target(S.faces, now, frame)
             update_object(frame)
+            feed_memory_and_positivity(frame, now)
         S.target = Obj.box if Obj.box is not None else S.face_target
         S.aim = _center(Obj.box) if Obj.box is not None else (S.target_eyes if S.face_target is not None else None)
         Servo.track(now)
@@ -1575,6 +1595,20 @@ def camera_loop():
         if S.close_hits >= 5:
             print("Window closed."); shutdown()
 
+def _px(frame, b):
+    h, w = frame.shape[:2]
+    return (int(b[0] * w), int(b[1] * h), int(b[2] * w), int(b[3] * h))
+
+def feed_memory_and_positivity(frame, now):
+    """Hand this frame to the memory face identifier and the positivity bus (both take pixel boxes)."""
+    if POSITIVITY.enabled:
+        try: POSITIVITY.bus.publish(frame, [_px(frame, b) for b in S.faces])
+        except Exception: pass
+    if MEMORY.enabled:
+        seen = S.face_target is not None and S.last_face_t == now   # the locked person was actually seen this frame
+        try: MEMORY.identifier.submit(frame, _px(frame, S.face_target) if seen else None)
+        except Exception: pass
+
 def shutdown():
     if S.quit: return
     S.quit = True
@@ -1583,7 +1617,7 @@ def shutdown():
     except Exception: pass
     try: convo and convo.end_session()
     except Exception: pass
-    os._exit(0)
+    close_and_exit(lambda: (POSITIVITY.close(), MEMORY.close()))   # bounded, so a stuck DB can't hang ESC
 
 # ------------------------------------------------------------------ voice session
 class SmartAudio(DefaultAudioInterface):
@@ -1610,14 +1644,45 @@ def build_client_tools():
     for name, fn in TOOLS.items(): ct.register(name, fn)
     return ct
 
-def on_agent(t):  print("JARVIS:", t); S.cap_agent = (t, time.time())
-def on_user(t):   print("You:", t);    S.cap_user = (t, time.time()); S.last_user_t = time.time()
+def on_agent(t):
+    print("JARVIS:", t); S.cap_agent = (t, time.time())
+    MEMORY.ingestor.on_agent(t)
+
+def on_user(t):
+    deliver = True
+    if POSITIVITY.enabled:
+        try: deliver = POSITIVITY.on_user_transcript(t)   # False = an opt-out phrase, kept out of memory and logs
+        except Exception: pass
+    S.last_user_t = time.time()
+    if not deliver: return
+    print("You:", t); S.cap_user = (t, time.time())
+    MEMORY.ingestor.on_user(t)
+
+def start_memory_and_positivity():
+    global MEMORY, POSITIVITY
+    # The memory config uses relative paths; pin them to this folder so it works from any working directory.
+    os.environ.setdefault("LOCAL_FALLBACK_PATH", str(BASE / "data" / "fallback.sqlite3"))
+    os.environ.setdefault("FACE_DETECTION_MODEL", str(MODELS / "face_detection_yunet_2023mar.onnx"))
+    os.environ.setdefault("FACE_RECOGNITION_MODEL", str(MODELS / "face_recognition_sface_2021dec.onnx"))
+    if os.getenv("MEMORY_ENABLED", "true").lower() != "false" and not os.getenv("ENCRYPTION_KEY"):
+        print("Memory: off (add ENCRYPTION_KEY to .env to turn it on: python scripts/gen_key.py)")
+    else:
+        if os.getenv("MEMORY_ENABLED", "true").lower() != "false":
+            try:
+                zoo_model("face_detection_yunet", "face_detection_yunet_2023mar.onnx")
+                zoo_model("face_recognition_sface", "face_recognition_sface_2021dec.onnx")
+            except Exception as e: print(f"Memory face models unavailable: {e}")
+        MEMORY = build_memory()
+        print(f"Memory: {'on' if MEMORY.enabled else 'off'}")
+    POSITIVITY = build_positivity(client, GEMINI, VISION_MODEL)
+    if POSITIVITY.enabled: print("Positivity: on")
 
 def main():
     global convo
     check_models()
     load_face_model()
     load_hand_models()
+    start_memory_and_positivity()
     Servo.load_dirs()
     Servo.connect()
     threading.Thread(target=camera_loop, daemon=True).start()

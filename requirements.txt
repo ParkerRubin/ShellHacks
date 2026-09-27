@@ -5,3 +5,11 @@ python-dotenv>=1.2
 google-genai>=2.25
 elevenlabs[pyaudio]>=2.69
 pyserial>=3.5
+pymongo>=4.10,<5
+cryptography>=42
+jsonschema>=4
+# Without this, jsonschema's date-time format check silently passes any string
+# (unknown formats are treated as unenforced annotations per the JSON Schema spec).
+rfc3339-validator>=0.1
+# Optional in operation; used only for positivity option A playback / voice spike.
+sounddevice>=0.5
