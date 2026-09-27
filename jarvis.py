@@ -36,7 +36,11 @@ MAX_ZOOM      = 8.0
 WATCH_EVERY   = float(os.getenv("WATCH_EVERY", "4"))      # seconds between watch checks
 SERVO_ENABLED = os.getenv("SERVO_ENABLED", "1") == "1"        # tries to connect; runs fine without the Arduino
 SERVO_PORT    = os.getenv("SERVO_PORT", "auto")                # "auto" finds the Arduino, or e.g. COM3
-SERVO_KP      = float(os.getenv("SERVO_KP", "10"))             # tracking strength (degrees per update at full-frame error)
+CAM_HFOV      = float(os.getenv("CAM_HFOV", "60"))             # camera's horizontal field of view in degrees (most webcams 55-78)
+SERVO_GAIN    = float(os.getenv("SERVO_GAIN", "0.5"))          # share of the error fixed per move: lower = calmer, higher = snappier
+SERVO_LEAD    = float(os.getenv("SERVO_LEAD", "0.08"))         # seconds to aim ahead of a moving target
+CAM_LATENCY   = float(os.getenv("CAM_LATENCY", "0.07"))        # seconds between a frame being captured and us seeing it
+AIM_Y         = float(os.getenv("AIM_Y", "0.45"))              # where your eyes should sit vertically in the frame (0 top, 1 bottom)
 PAN_DIR       = -1 if os.getenv("SERVO_INVERT_PAN", "0") == "1" else 1    # flip if it turns away from you
 TILT_DIR      = -1 if os.getenv("SERVO_INVERT_TILT", "0") == "1" else 1
 GEMINI_FALLBACKS = [m.strip() for m in os.getenv("GEMINI_FALLBACKS", "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash").split(",") if m.strip()]
@@ -93,6 +97,8 @@ class State:
     face_target = None    # smoothed box of the person being tracked
     candidate = None      # (box, frames seen) while deciding who to lock onto
     reacquire = None      # (box, frames seen) while confirming you're back after being hidden
+    target_eyes = None    # smoothed eye midpoint of the tracked person (what the head aims at)
+    aim = None            # point the servo head should center: your eyes, or the tracked object's center
     hands = []            # [(gesture, box_norm, landmarks_norm)]
     countdown_until = 0.0
     target = None         # smoothed box of the person being tracked
@@ -742,8 +748,12 @@ def hands_loop():
 # ------------------------------------------------------------------ servos (pan/tilt head)
 class Servo:
     ser = None; port = None
-    pan = 90.0; tilt = 90.0; sent = (None, None); last_send = 0.0
+    pan = 90.0; tilt = 90.0; sent = (None, None); last_send = 0.0      # pan/tilt = commanded angles
+    est_pan = 90.0; est_tilt = 90.0; est_t = 0.0                      # where the head physically is right now (estimated)
+    vel = (0.0, 0.0); prev_world = None; prev_t = 0.0                 # your angular velocity, for leading
+    est_hist = deque(maxlen=60)                                        # (time, est_pan, est_tilt) for latency compensation
     manual_until = 0.0     # after a turn_camera command, tracking waits so it doesn't fight you
+    EASE, MAX_STEP, TICK = 0.25, 4.0, 0.015                            # must match jarvis_servo.ino
 
     @classmethod
     def connect(cls):
@@ -774,21 +784,62 @@ class Servo:
         cls.pan, cls.tilt = min(max(cls.pan, 20), 160), min(max(cls.tilt, 45), 135)
         cur = (int(round(cls.pan)), int(round(cls.tilt)))
         now = time.time()
-        if force or (cur != cls.sent and now - cls.last_send > 0.03):
+        if force or (cur != cls.sent and now - cls.last_send > 0.02):
             try: cls.ser.write(f"{cur[0]},{cur[1]}\n".encode()); cls.sent, cls.last_send = cur, now
             except Exception as e: print(f"Servo write failed: {e}"); cls.ser = None
 
     @classmethod
+    def _simulate(cls, now):
+        """Mirror the Arduino's glide so we know where the head actually is mid-move."""
+        if cls.est_t == 0.0: cls.est_t = now
+        ticks = min(40, int((now - cls.est_t) / cls.TICK))
+        cls.est_t += ticks * cls.TICK
+        for _ in range(ticks):
+            for attr, cmd in (("est_pan", float(cls.sent[0] or 90)), ("est_tilt", float(cls.sent[1] or 90))):
+                d = cmd - getattr(cls, attr)
+                step = max(-cls.MAX_STEP, min(cls.MAX_STEP, d * cls.EASE)) if abs(d) > 0.5 else d
+                setattr(cls, attr, getattr(cls, attr) + step)
+        cls.est_hist.append((now, cls.est_pan, cls.est_tilt))
+
+    @classmethod
+    def _pose_at(cls, t):
+        """Where the head was pointing at time t (when the frame we're looking at was captured)."""
+        for ts, p, q in reversed(cls.est_hist):
+            if ts <= t: return p, q
+        return (cls.est_hist[0][1], cls.est_hist[0][2]) if cls.est_hist else (cls.est_pan, cls.est_tilt)
+
+    @classmethod
     def track(cls, now):
-        """Closed-loop: nudge the head so the main face moves toward the center of the frame."""
-        if cls.ser is None or now < cls.manual_until: return
-        if S.target is not None:
-            x, y, w, h = S.target
-            ex, ey = (x + w / 2) - 0.5, (y + h / 2) - 0.45
-            if abs(ex) > 0.06: cls.pan -= PAN_DIR * max(-4, min(4, ex * SERVO_KP))
-            if abs(ey) > 0.08: cls.tilt += TILT_DIR * max(-3, min(3, ey * SERVO_KP))
-        elif now - S.last_face_t > 10:                           # nobody for a while: drift home
-            cls.pan += (90 - cls.pan) * 0.02; cls.tilt += (90 - cls.tilt) * 0.02
+        """Keep eye contact: turn the aim point's offset in the image into degrees and go there in one move,
+        from where the head actually is (not where we last told it to go), leading a moving target slightly."""
+        if cls.ser is None: return
+        cls._simulate(now)
+        if now < cls.manual_until: return
+        if S.aim is not None:
+            ax, ay = S.aim
+            vfov = CAM_HFOV * 0.75                                   # 4:3 webcam
+            ex, ey = ax - 0.5, ay - AIM_Y
+            # where you are in the world, in servo degrees. The image is ~CAM_LATENCY old, so measure from where
+            # the head was pointing when it was captured, not where it is now (otherwise it chases its own motion)
+            cp, ct = cls._pose_at(now - CAM_LATENCY)
+            wx = cp - PAN_DIR * ex * CAM_HFOV
+            wy = ct + TILT_DIR * ey * vfov
+            if cls.prev_world is not None and now - cls.prev_t > 0:
+                dt = now - cls.prev_t
+                vx = (wx - cls.prev_world[0]) / dt; vy = (wy - cls.prev_world[1]) / dt
+                vx = max(-120, min(120, vx)); vy = max(-80, min(80, vy))   # ignore detection jumps
+                cls.vel = (cls.vel[0] * 0.7 + vx * 0.3, cls.vel[1] * 0.7 + vy * 0.3)
+            cls.prev_world, cls.prev_t = (wx, wy), now
+            lead_x = max(-4.0, min(4.0, cls.vel[0] * SERVO_LEAD))   # lead a steady walk, not a sudden jump
+            lead_y = max(-3.0, min(3.0, cls.vel[1] * SERVO_LEAD))
+            if abs(ex) > 0.03:                                       # small deadband so it doesn't twitch
+                cls.pan = cls.est_pan + SERVO_GAIN * (wx - cls.est_pan) + lead_x
+            if abs(ey) > 0.04:
+                cls.tilt = cls.est_tilt + SERVO_GAIN * (wy - cls.est_tilt) + lead_y
+        else:
+            cls.prev_world, cls.vel = None, (0.0, 0.0)
+            if now - S.last_face_t > 10:                             # nobody for a while: drift home
+                cls.pan += (90 - cls.pan) * 0.02; cls.tilt += (90 - cls.tilt) * 0.02
         cls.send()
 
 @tool
@@ -843,15 +894,20 @@ def detect_faces(frame):
     if _yunet is not None:
         _yunet.setInputSize((w, h))
         _, res = _yunet.detect(frame)
-        boxes = [] if res is None else [tuple(float(v) for v in r[:4]) for r in res if r[14] >= 0.75]
+        rows = [] if res is None else [r for r in res if r[14] >= 0.75]
+        boxes = [tuple(float(v) for v in r[:4]) for r in rows]
+        eyes = [((float(r[4]) + float(r[6])) / 2 / w, (float(r[5]) + float(r[7])) / 2 / h) for r in rows]
     elif _face_cascade is not None:
         boxes = _face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5, minSize=(80, 80))
+        eyes = [((x + bw / 2) / w, (y + bh * 0.4) / h) for x, y, bw, bh in boxes]   # eyes sit ~40% down a face box
     else:
-        boxes = []
+        boxes, eyes = [], []
     out = []
-    for x, y, bw, bh in boxes:
+    EYES.clear()
+    for (x, y, bw, bh), e in zip(boxes, eyes):
         x, y = max(0.0, x), max(0.0, y)
-        out.append((x / w, y / h, min(bw, w - x) / w, min(bh, h - y) / h))
+        b = (x / w, y / h, min(bw, w - x) / w, min(bh, h - y) / h)
+        out.append(b); EYES[b] = e
     out.sort(key=lambda b: -b[2] * b[3])
     # Foreground only: people walking by in the background are small. Drop faces below FACE_MIN of the frame
     # height, and anything much smaller than the nearest face.
@@ -860,7 +916,12 @@ def detect_faces(frame):
         out = [b for b in out if b[3] >= FACE_MIN and b[3] >= big * 0.6]
     return out
 
+EYES = {}   # face box -> eye midpoint (normalized), for the current frame
+
 def _center(b): return b[0] + b[2] / 2, b[1] + b[3] / 2
+
+def _eyes(b):
+    return EYES.get(b, (b[0] + b[2] / 2, b[1] + b[3] * 0.4))
 
 def update_target(faces, now):
     """Lock onto one main person and stay on them.
@@ -888,6 +949,8 @@ def update_target(faces, now):
             S.last_face_t = now
             a = 0.45                                        # smoothing: higher = snappier, lower = steadier
             S.face_target = tuple(o * (1 - a) + n * a for o, n in zip(S.face_target, best))
+            e = _eyes(best)
+            S.target_eyes = e if S.target_eyes is None else tuple(o * 0.4 + n * 0.6 for o, n in zip(S.target_eyes, e))
         elif now - S.last_face_t > LOCK_HOLD:
             S.face_target, S.candidate = None, None         # you're gone: free to lock onto someone new
         return
@@ -903,6 +966,7 @@ def update_target(faces, now):
         S.candidate = (c[0], c[1] + 1)
         if S.candidate[1] >= 15:                            # stayed put ~0.5s: someone sitting here, not walking by
             S.face_target, S.candidate, S.last_face_t = pick, None, now
+            S.target_eyes = _eyes(pick)
     else:
         S.candidate = (pick, 1)
 
@@ -1288,6 +1352,7 @@ def camera_loop():
             update_target(S.faces, now)
             update_object(frame)
         S.target = Obj.box if Obj.box is not None else S.face_target
+        S.aim = _center(Obj.box) if Obj.box is not None else (S.target_eyes if S.face_target is not None else None)
         Servo.track(now)
         update_follow(now)
         view = apply_zoom(frame)
