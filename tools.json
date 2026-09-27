@@ -214,11 +214,11 @@
   },
   {
     "name": "turn_camera",
-    "description": "Physically turn the robot's camera head (pan/tilt servos) to look somewhere else. It normally tracks the user's face on its own; use this when asked to look in a direction or to look around.",
+    "description": "Physically turn the robot's camera head left or right (it's a pan-only servo, no up/down). It normally follows the user's face on its own; use this when asked to look left, look right, or back to center.",
     "parameters": {
       "direction": {
         "type": "string",
-        "description": "left, right, up, down, or center."
+        "description": "left, right, or center."
       },
       "degrees": {
         "type": "number",

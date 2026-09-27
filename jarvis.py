@@ -102,6 +102,9 @@ class State:
     candidate = None      # (box, frames seen) while deciding who to lock onto
     reacquire = None      # (box, frames seen) while confirming you're back after being hidden
     target_eyes = None    # smoothed eye midpoint of the tracked person (what the head aims at)
+    prev_head = None      # head pan (at capture time) on the previous frame, for motion compensation
+    lost_t = -99.0        # when the lock last dropped
+    others = deque(maxlen=90)   # (time, center, head shift) of other people seen while tracking you
     aim = None            # point the servo head should center: your eyes, or the tracked object's center
     hands = []            # [(gesture, box_norm, landmarks_norm)]
     countdown_until = 0.0
@@ -776,7 +779,7 @@ class Servo:
 
     @classmethod
     def recalibrate(cls):
-        cls.calib, cls.probe = None, None
+        cls.calib, cls.probe, cls.calib_fails, cls.auto = None, None, 0, True
         try: cls.DIRS_FILE.unlink()
         except Exception: pass
         set_status("Servo calibration: sit still in front of the camera")
@@ -800,8 +803,16 @@ class Servo:
         elif phase == "move" and now - t0 > 0.55 + CAM_LATENCY:          # glide done and a fresh frame is in
             d = e - e0
             if not 0.05 < abs(d) < 0.3:                                 # too small: servo didn't turn. too big: you moved
-                print(f"[calibration] {axis}: unclear result ({d:+.3f}), will retry when you're still")
-                cls.probe = None; cls.pan, cls.tilt = base; cls.calib_retry = now + 3; return
+                cls.probe = None; cls.pan, cls.tilt = base; cls.calib_retry = now + 3
+                cls.calib_fails += 1
+                if cls.calib_fails >= 3:                                # servo not moving the camera? stop twitching
+                    cls.calib, cls.auto = "done", False
+                    print("[calibration] couldn't measure the head's direction (is the servo powered?). "
+                          "Auto-follow is off; arrows still work. Press K to try again.")
+                    set_status("Servo calibration failed: auto-follow off (K to retry)", 6)
+                else:
+                    print(f"[calibration] {axis}: unclear result ({d:+.3f}), will retry when you're still")
+                cls.send(); return
             if axis == "pan":
                 ok = (d > 0) == (PAN_DIR > 0)                           # model: +pan shifts you right in the image when PAN_DIR=+1
                 if not ok: PAN_DIR = -PAN_DIR
@@ -819,6 +830,8 @@ class Servo:
                 set_status(f"Servo calibrated (pan {PAN_DIR:+d}, tilt {TILT_DIR:+d})", 4)
         cls.send()
     calib_retry = 0.0
+    calib_fails = 0
+    last_seen = (-99.0, 0.0, 90.0)                                     # (time, image offset, world angle) when last seen
     auto = True            # X toggles face/object following on and off
     STEP = float(os.getenv("SERVO_STEP", "5"))                         # degrees per arrow-key press (hold to keep turning)
 
@@ -840,6 +853,29 @@ class Servo:
         cls.manual_until = 0.0
         set_status("Servo auto-follow ON" if cls.auto else "Servo auto-follow OFF (arrows only)", 3)
     still_hist = deque(maxlen=30)                                       # recent (t, ex) to check you're sitting still
+
+    @classmethod
+    def connect(cls):
+        if not SERVO_ENABLED: return
+        try:
+            import serial, serial.tools.list_ports
+        except ImportError:
+            print("pyserial not installed, servos off"); return
+        ports = [SERVO_PORT] if SERVO_PORT != "auto" else \
+            [p.device for p in serial.tools.list_ports.comports()
+             if any(k in f"{p.description} {p.manufacturer}".lower() for k in ("arduino", "ch340", "usb serial", "usb-serial", "cp210"))]
+        for port in ports:
+            try:
+                cls.ser = serial.Serial(port, 115200, timeout=0.2); cls.port = port
+                banner, t0 = b"", time.time()                    # opening the port resets the Arduino (~2-3s incl. wiggle)
+                while time.time() - t0 < 4 and b"ready" not in banner.lower():
+                    banner += cls.ser.read(64)
+                txt = banner.decode(errors="ignore").strip()
+                print(f"Servos connected on {port}: " + (txt if txt else "no reply (old firmware? upload jarvis_servo.ino)"))
+                cls.send(force=True); return
+            except Exception as e:
+                print(f"Servo port {port}: {e}")
+        print("No Arduino found, servos off. Set SERVO_PORT in .env if it's plugged in.")
 
     @classmethod
     def send(cls, force=False):
@@ -901,17 +937,26 @@ class Servo:
                 vx = max(-120, min(120, vx)); vy = max(-80, min(80, vy))   # ignore detection jumps
                 cls.vel = (cls.vel[0] * 0.7 + vx * 0.3, cls.vel[1] * 0.7 + vy * 0.3)
             cls.prev_world, cls.prev_t = (wx, wy), now
+            cls.last_seen = (now, ex, wx)
             lead_x = max(-4.0, min(4.0, cls.vel[0] * SERVO_LEAD))   # lead a steady walk, not a sudden jump
             lead_y = max(-3.0, min(3.0, cls.vel[1] * SERVO_LEAD))
+            # calm near the center, aggressive near the edge where you're about to leave the frame
+            gain = SERVO_GAIN + (0.95 - SERVO_GAIN) * min(1.0, max(0.0, (abs(ex) - 0.15) / 0.2))
+            if abs(ex) > 0.25: lead_x = max(-10.0, min(10.0, cls.vel[0] * SERVO_LEAD * 2))
             if abs(ex) > 0.03:                                       # small deadband so it doesn't twitch
-                cls.pan = cls.est_pan + SERVO_GAIN * (wx - cls.est_pan) + lead_x
+                cls.pan = cls.est_pan + gain * (wx - cls.est_pan) + lead_x
             if abs(ey) > 0.04:
                 cls.tilt = cls.est_tilt + SERVO_GAIN * (wy - cls.est_tilt) + lead_y
         else:
+            ls_t, ls_ex, ls_wx = cls.last_seen
+            if now - ls_t < 2.0 and abs(ls_ex) > 0.2 and cls.calib == "done" and cls.auto:
+                # you left through the edge of the frame: keep turning that way to find you
+                cls.pan = ls_wx - PAN_DIR * (1 if ls_ex > 0 else -1) * 12
+                cls.send(); return
             cls.prev_world, cls.vel = None, (0.0, 0.0)
             if cls.probe is not None:                                # lost you mid-calibration: undo and retry later
                 cls.pan, cls.tilt = cls.probe[4]; cls.probe = None
-            if now - S.last_face_t > 2.5:                            # lost you: ease back to center to find you again
+            if now - S.last_face_t > 3.5:                            # lost you: ease back to center to find you again
                 cls.pan += (90 - cls.pan) * 0.05; cls.tilt += (90 - cls.tilt) * 0.05
         cls.send()
 
@@ -956,7 +1001,7 @@ def load_face_model():
     global _yunet
     for fname in ("face_detection_yunet_2026may.onnx", "face_detection_yunet_2023mar.onnx"):
         try:
-            _yunet = cv2.FaceDetectorYN.create(str(zoo_model("face_detection_yunet", fname)), "", (320, 320), 0.6, 0.3, 50)
+            _yunet = cv2.FaceDetectorYN.create(str(zoo_model("face_detection_yunet", fname)), "", (320, 320), 0.5, 0.3, 50)
             print(f"Face detector: YuNet ({fname})"); return
         except Exception as e:
             print(f"YuNet {fname} failed: {e}")
@@ -969,7 +1014,7 @@ def detect_faces(frame):
     if _yunet is not None:
         _yunet.setInputSize((w, h))
         _, res = _yunet.detect(frame)
-        rows = [] if res is None else [r for r in res if r[14] >= 0.75]
+        rows = [] if res is None else [r for r in res if r[14] >= 0.5]
         SCORES.clear()
         boxes = [tuple(float(v) for v in r[:4]) for r in rows]
         eyes = [((float(r[4]) + float(r[6])) / 2 / w, (float(r[5]) + float(r[7])) / 2 / h) for r in rows]
@@ -1002,21 +1047,87 @@ def _center(b): return b[0] + b[2] / 2, b[1] + b[3] / 2
 def _eyes(b):
     return EYES.get(b, (b[0] + b[2] / 2, b[1] + b[3] * 0.4))
 
-def update_target(faces, now):
+class FaceBridge:
+    """VitTrack follows your face box between detections, so blur, a turned head or a hand in front of your face
+    doesn't break the lock. YuNet re-anchors it whenever it sees you."""
+    tracker = None; frames = 0; last_det = 0.0
+
+    @classmethod
+    def anchor(cls, frame, box, now):
+        cls.last_det = now
+        cls.frames += 1
+        if cls.tracker is not None and cls.frames % 10: return       # re-anchor every ~1/3 s
+        try:
+            if cls.tracker is None:
+                p = cv2.TrackerVit_Params()
+                p.net = str(zoo_model("object_tracking_vittrack", "object_tracking_vittrack_2023sep.onnx"))
+                cls.tracker = cv2.TrackerVit_create(p)
+            h, w = frame.shape[:2]
+            cls.tracker.init(frame, (int(box[0] * w), int(box[1] * h), max(8, int(box[2] * w)), max(8, int(box[3] * h))))
+        except Exception:
+            cls.tracker = None
+
+    @classmethod
+    def follow(cls, frame, now):
+        if cls.tracker is None or now - cls.last_det > 2.5: return None   # don't coast forever on a guess
+        try:
+            ok, b = cls.tracker.update(frame)
+            if not ok or cls.tracker.getTrackingScore() < 0.35: return None
+        except Exception:
+            return None
+        h, w = frame.shape[:2]
+        return (b[0] / w, b[1] / h, b[2] / w, b[3] / h)
+
+    @classmethod
+    def reset(cls):
+        cls.tracker, cls.frames = None, 0
+
+def head_shift(now):
+    """How far (normalized image x) everything in view moved because the head turned since the last frame.
+    From calibration: +1 degree of pan shifts the scene PAN_DIR/CAM_HFOV to the right."""
+    if Servo.ser is None or Servo.calib != "done" or not Servo.est_hist: 
+        S.prev_head = None; return 0.0
+    p, _ = Servo._pose_at(now - CAM_LATENCY)
+    prev = S.prev_head; S.prev_head = p
+    return 0.0 if prev is None else PAN_DIR * (p - prev) / CAM_HFOV
+
+def _was_other(f, now):
+    """True if another person was at this spot within the last second (a teammate beside you, not you)."""
+    cx, cy = _center(f)
+    return any(now - t < 1.0 and ((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5 < 0.12 for t, (ox, oy), _ in S.others)
+
+def update_target(faces, now, frame=None):
     """Lock onto one main person and stay on them.
-    - Locking on needs a big, fairly central face that stays put for ~0.3s (a passerby doesn't qualify).
-    - Once locked, only a face near where you were counts as you. Other faces never steal the lock.
-    - If you're hidden briefly (turned away, hand in front), the lock holds for LOCK_HOLD seconds."""
+    - Locking on needs a big, clear, fairly central face that stays put for ~0.3s (a passerby doesn't qualify).
+    - Once locked, a face near where you're expected to be counts as you. When the head turns, the expected spot moves
+      with it, so the head's own motion never looks like you leaving. Other faces never steal the lock.
+    - Between detections (blur, turned head, hand in the way) VitTrack keeps following your face box.
+    - If you're really gone, the lock holds for LOCK_HOLD seconds, then frees up."""
+    shift = head_shift(now)
     if S.face_target is not None:
+        x, y, w_, h_ = S.face_target
+        S.face_target = (x + shift, y, w_, h_)                       # where the head's own turn moved you in the image
+        if S.target_eyes: S.target_eyes = (S.target_eyes[0] + shift, S.target_eyes[1])
         tcx, tcy = _center(S.face_target)
-        gate = max(0.08, 0.6 * S.face_target[2])            # how far you can move between frames and still be "you"
+        gate = max(0.12, 0.9 * S.face_target[2])            # how far you can move between frames and still be "you"
         th = S.face_target[3]
         near = [f for f in faces if ((_center(f)[0] - tcx) ** 2 + (_center(f)[1] - tcy) ** 2) ** 0.5 < gate
-                and 0.65 < f[3] / th < 1.5]                 # and about your size (not someone leaning in behind you)
+                and 0.6 < f[3] / th < 1.6]                  # and about your size (not someone leaning in behind you)
+        bridged = jumped = False
+        if not near and len(faces) == 1 and now - S.last_face_t < 0.6 and 0.6 < faces[0][3] / th < 1.6 \
+                and not _was_other(faces[0], now):
+            near, jumped = [faces[0]], True                 # moved fast, but you're the only face here: still you
+        if not near and frame is not None:                  # detector missed you this frame: ask the tracker
+            b = FaceBridge.follow(frame, now)
+            if b and ((_center(b)[0] - tcx) ** 2 + (_center(b)[1] - tcy) ** 2) ** 0.5 < gate and 0.5 < b[3] / th < 2:
+                near, bridged = [b], True
         if near:
             best = min(near, key=lambda f: (_center(f)[0] - tcx) ** 2 + (_center(f)[1] - tcy) ** 2)
-            if now - S.last_face_t > 0.25:                  # you were hidden: make sure this is you settling back,
-                r = S.reacquire                             # not someone walking through your spot
+            for f in faces:                                 # remember where other people are, so we never mistake them for you
+                if f is not best: S.others.append((now, _center(f), shift))
+            others = len(faces) > 1
+            if now - S.last_face_t > 1.0 and others and not bridged:   # long gap with other people around: make sure
+                r = S.reacquire                                        # it's you settling back, not a passerby
                 if r and ((_center(best)[0] - _center(r[0])[0]) ** 2 + (_center(best)[1] - _center(r[0])[1]) ** 2) ** 0.5 < 0.05:
                     S.reacquire = (r[0], r[1] + 1)
                 else:
@@ -1026,12 +1137,17 @@ def update_target(faces, now):
                     return
             S.reacquire = None
             S.last_face_t = now
-            a = 0.45                                        # smoothing: higher = snappier, lower = steadier
+            a = 1.0 if jumped else 0.6                      # smoothing: higher = snappier, lower = steadier
             S.face_target = tuple(o * (1 - a) + n * a for o, n in zip(S.face_target, best))
             e = _eyes(best)
-            S.target_eyes = e if S.target_eyes is None else tuple(o * 0.4 + n * 0.6 for o, n in zip(S.target_eyes, e))
+            S.target_eyes = e if (S.target_eyes is None or jumped) else tuple(o * 0.3 + n * 0.7 for o, n in zip(S.target_eyes, e))
+            if frame is not None and not bridged:
+                if jumped: FaceBridge.reset()
+                FaceBridge.anchor(frame, best, now)
         elif now - S.last_face_t > LOCK_HOLD:
             S.face_target, S.candidate = None, None         # you're gone: free to lock onto someone new
+            S.lost_t = now
+            FaceBridge.reset()
         return
     if not faces:
         S.candidate = None; return
@@ -1043,12 +1159,14 @@ def update_target(faces, now):
     if not confident:
         S.candidate = None; return
     pick = max(confident, key=appeal)
+    recent = now - S.lost_t < 3.0 and not _was_other(pick, now)   # just lost you: take you back fast
     c = S.candidate                                         # (where they first appeared, frames seen)
-    if c and ((_center(pick)[0] - _center(c[0])[0]) ** 2 + (_center(pick)[1] - _center(c[0])[1]) ** 2) ** 0.5 < 0.1:
+    if c and ((_center(pick)[0] - _center(c[0])[0]) ** 2 + (_center(pick)[1] - _center(c[0])[1]) ** 2) ** 0.5 < (0.25 if recent else 0.1):
         S.candidate = (c[0], c[1] + 1)
-        if S.candidate[1] >= 15:                            # stayed put ~0.5s: someone sitting here, not walking by
+        if S.candidate[1] >= (4 if recent else 10):                            # stayed put ~0.3s: someone sitting here, not walking by
             S.face_target, S.candidate, S.last_face_t = pick, None, now
             S.target_eyes = _eyes(pick)
+            if frame is not None: FaceBridge.reset(); FaceBridge.anchor(frame, pick, now)
     else:
         S.candidate = (pick, 1)
 
@@ -1433,7 +1551,7 @@ def camera_loop():
             print(f"Running at ~{S.fps:.0f} fps" + ("  (slow: try CAM_RES=native or CAM_BACKEND=dshow in .env)" if S.fps < 15 else ""))
         if ok:
             S.faces = detect_faces(frame)
-            update_target(S.faces, now)
+            update_target(S.faces, now, frame)
             update_object(frame)
         S.target = Obj.box if Obj.box is not None else S.face_target
         S.aim = _center(Obj.box) if Obj.box is not None else (S.target_eyes if S.face_target is not None else None)

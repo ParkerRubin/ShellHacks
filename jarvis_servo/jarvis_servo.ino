@@ -12,7 +12,11 @@ const int TILT_PIN = 10;
 const int PAN_MIN  = 20,  PAN_MAX  = 160;   // keep in sync with jarvis.py limits
 const int TILT_MIN = 45,  TILT_MAX = 135;
 
-const float MAX_STEP       = 2.5;   // degrees per tick, lower = smoother/slower
+// Eased glide: covers 25% of the remaining distance each tick, capped at MAX_STEP.
+// Big moves are fast, and it slows down as it lands so it doesn't overshoot or wobble.
+// jarvis.py mirrors these three numbers to estimate where the head is mid-move, so keep them in sync.
+const float EASE           = 0.25;
+const float MAX_STEP       = 4.0;   // degrees per tick (~265 deg/s top speed)
 const unsigned long TICK_MS = 15;   // update rate (~66 Hz)
 
 Servo pan, tilt;
@@ -22,6 +26,12 @@ unsigned long lastTick = 0;
 
 char buf[24];
 byte len = 0;
+
+float glide(float pos, int target) {
+  float d = target - pos;
+  if (fabs(d) <= 0.5) return target;         // close enough: land exactly
+  return pos + constrain(d * EASE, -MAX_STEP, MAX_STEP);
+}
 
 void handleLine(char *s) {
   if (s[0] == '?') {                         // "?" -> report position
@@ -72,8 +82,8 @@ void loop() {
   // glide toward the target
   if (millis() - lastTick >= TICK_MS) {
     lastTick = millis();
-    panPos  += constrain(panTarget  - panPos,  -MAX_STEP, MAX_STEP);
-    tiltPos += constrain(tiltTarget - tiltPos, -MAX_STEP, MAX_STEP);
+    panPos  = glide(panPos,  panTarget);
+    tiltPos = glide(tiltPos, tiltTarget);
     pan.write((int)(panPos + 0.5));
     tilt.write((int)(tiltPos + 0.5));
   }

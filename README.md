@@ -29,7 +29,7 @@ A clickable control bar is always on screen: zoom out, zoom level (click to rese
 
 Right-drag a box to track an object, right-click to stop.
 
-Keys: `SPACE` mic mute / wake, `G` gestures, `A` autonomy, `C` follow me, `S` servo test, `F` fullscreen, `M` fit/fill, `T` pin on top, `P` photo, `R` record, `+`/`-` zoom, arrows pan, `0` reset, `ESC` quit.
+Keys: left/right arrows turn the servo head by hand (auto-follow resumes 4s after your last press), `X` auto-follow off/on, `SPACE` mic mute / wake, `G` gestures, `A` autonomy, `C` follow me, `S` servo test, `F` fullscreen, `M` fit/fill, `T` pin on top, `P` photo, `R` record, `+`/`-` zoom, up/down arrows pan the zoomed view (left/right too if no servo is connected), `0` reset, `ESC` quit.
 
 ## Servo head
 
