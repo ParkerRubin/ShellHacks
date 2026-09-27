@@ -1,0 +1,215 @@
+[
+  {
+    "name": "look",
+    "description": "Look through the camera and answer a question about what is in view (objects, text, people, colors, counts). Use whenever the user asks what you see, what they are holding, or anything about the physical scene.",
+    "parameters": {
+      "question": {
+        "type": "string",
+        "description": "The user's question about the scene, e.g. 'what brand is this' or 'how many people are here'. Leave empty for a general description."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "take_photo",
+    "description": "Save a photo of the current camera view (including zoom) to the session folder.",
+    "parameters": {
+      "label": {
+        "type": "string",
+        "description": "Optional short label for the file name, e.g. 'front bumper'."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "start_recording",
+    "description": "Start recording video of the camera view.",
+    "parameters": {
+      "max_seconds": {
+        "type": "number",
+        "description": "Optional. Stop automatically after this many seconds."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "stop_recording",
+    "description": "Stop the current video recording and save it.",
+    "parameters": {},
+    "required": []
+  },
+  {
+    "name": "zoom",
+    "description": "Zoom the camera view. Use target to zoom onto a specific object, direction for 'zoom in' or 'zoom out', or level for an exact amount (1 = full wide view, up to 8).",
+    "parameters": {
+      "target": {
+        "type": "string",
+        "description": "Object to zoom onto, e.g. 'the label on the bottle'."
+      },
+      "direction": {
+        "type": "string",
+        "description": "'in' or 'out'."
+      },
+      "level": {
+        "type": "number",
+        "description": "Exact zoom level from 1 (widest) to 8."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "pan",
+    "description": "Move the zoomed view left, right, up, down, or back to center.",
+    "parameters": {
+      "direction": {
+        "type": "string",
+        "description": "left, right, up, down, or center."
+      }
+    },
+    "required": [
+      "direction"
+    ]
+  },
+  {
+    "name": "set_window",
+    "description": "Change the camera window: fullscreen, windowed, wide, tall, small, large, fit (show whole image), fill (fill window, crop edges), pin (always on top), unpin, or custom with width and height.",
+    "parameters": {
+      "mode": {
+        "type": "string",
+        "description": "fullscreen, windowed, wide, tall, small, large, fit, fill, pin, unpin, or custom."
+      },
+      "width": {
+        "type": "number",
+        "description": "Window width in pixels, only for custom."
+      },
+      "height": {
+        "type": "number",
+        "description": "Window height in pixels, only for custom."
+      }
+    },
+    "required": [
+      "mode"
+    ]
+  },
+  {
+    "name": "read_text",
+    "description": "Read all text visible to the camera (documents, labels, whiteboards). By default copies it to the clipboard.",
+    "parameters": {
+      "then": {
+        "type": "string",
+        "description": "copy (default, puts it on the clipboard), save (adds it to notes), or say (just read it back)."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "look_at_screen",
+    "description": "Take a screenshot of the user's computer screen and answer a question about it.",
+    "parameters": {
+      "question": {
+        "type": "string",
+        "description": "What the user wants to know about their screen."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "save_note",
+    "description": "Write something down in the session notes.",
+    "parameters": {
+      "text": {
+        "type": "string",
+        "description": "The note to save."
+      }
+    },
+    "required": [
+      "text"
+    ]
+  },
+  {
+    "name": "search_web",
+    "description": "Open a web search in the user's browser. Useful after look, e.g. to find where to buy or learn about an object.",
+    "parameters": {
+      "query": {
+        "type": "string",
+        "description": "Search query."
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  {
+    "name": "open_item",
+    "description": "Open something on the computer: the captures folder, the last photo, the last video, the notes, or the report.",
+    "parameters": {
+      "what": {
+        "type": "string",
+        "description": "folder, last_photo, last_video, notes, or report."
+      }
+    },
+    "required": [
+      "what"
+    ]
+  },
+  {
+    "name": "make_report",
+    "description": "Build a report of this session (photos with AI captions, videos, notes, observations) plus a written summary, then open it.",
+    "parameters": {
+      "title": {
+        "type": "string",
+        "description": "Report title."
+      },
+      "purpose": {
+        "type": "string",
+        "description": "What the report is for, e.g. 'insurance claim', 'home inventory', 'lab notes'. Shapes the summary."
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "watch_for",
+    "description": "Keep watching the camera in the background and alert when something appears (e.g. 'a person', 'my dog', 'the package'). Takes a photo when it happens. Pass target 'stop' to stop watching.",
+    "parameters": {
+      "target": {
+        "type": "string",
+        "description": "What to watch for, or 'stop'."
+      }
+    },
+    "required": [
+      "target"
+    ]
+  },
+  {
+    "name": "follow_me",
+    "description": "Turn auto-framing on or off. When on, the view automatically zooms and pans to keep the user's face centered, like a camera operator.",
+    "parameters": {
+      "on": {
+        "type": "boolean",
+        "description": "true to start following, false to stop."
+      }
+    },
+    "required": [
+      "on"
+    ]
+  },
+  {
+    "name": "sleep",
+    "description": "Stop listening. Use when the user says be quiet, go to sleep, stop listening, mute, or that's all. The user presses Space to wake you.",
+    "parameters": {},
+    "required": []
+  },
+  {
+    "name": "set_autonomy",
+    "description": "Change how independent you are. off: only act when asked. aware: quietly track what's happening but only speak when spoken to. proactive: speak up on your own when something notable happens (someone arrives, holds something up, a new person joins).",
+    "parameters": {
+      "level": {
+        "type": "string",
+        "description": "off, aware, or proactive."
+      }
+    },
+    "required": [
+      "level"
+    ]
+  }
+]
