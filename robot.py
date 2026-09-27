@@ -44,23 +44,31 @@ def drive_servo(target, force=False):
 locked_center = None
 lost_streak = 0
 LOST_RESET_FRAMES = 15  # ~0.5s of nothing before we allow snapping to a new face
+MAX_JUMP_FRAC = 0.35    # a "closest" candidate further than this (x frame diagonal) from
+                        # the lock is probably a false detection, not the same person moving
 
-def pick_face(faces):
+def pick_face(faces, diag):
     """Stay locked on the previously-tracked face instead of re-picking the
-    biggest one every frame, so a person walking into the background doesn't
-    steal the camera."""
+    biggest one every frame, so a person walking into the background (or a
+    stray false-positive when the real face briefly drops out) doesn't steal
+    the camera."""
     global locked_center, lost_streak
-    if not len(faces):
+    face = None
+    if len(faces):
+        if locked_center is None:
+            face = max(faces, key=lambda f: f[2] * f[3])
+        else:
+            lx, ly = locked_center
+            candidate = min(faces, key=lambda f: (f[0] + f[2] / 2 - lx) ** 2 + (f[1] + f[3] / 2 - ly) ** 2)
+            cx, cy = candidate[0] + candidate[2] / 2, candidate[1] + candidate[3] / 2
+            if ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5 <= MAX_JUMP_FRAC * diag:
+                face = candidate
+    if face is None:
         lost_streak += 1
         if lost_streak > LOST_RESET_FRAMES:
             locked_center = None
         return None
     lost_streak = 0
-    if locked_center is None:
-        face = max(faces, key=lambda f: f[2] * f[3])
-    else:
-        lx, ly = locked_center
-        face = min(faces, key=lambda f: (f[0] + f[2] / 2 - lx) ** 2 + (f[1] + f[3] / 2 - ly) ** 2)
     x, y, fw, fh = face
     locked_center = (x + fw / 2, y + fh / 2)
     return face
@@ -88,7 +96,7 @@ def camera_loop():
                 positivity.bus.publish(frame, faces)
             except Exception:
                 pass
-        target = pick_face(faces)
+        target = pick_face(faces, (w * w + h * h) ** 0.5)
         if target is not None:
             memory.identifier.submit(frame, target)
             if not manual_active(time.time()):
