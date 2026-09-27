@@ -32,17 +32,49 @@ except Exception as e:
     ser = None; print("No servos:", e)
 
 smoothed_pan = 90; last_sent = 90
-def drive_servo(target):
+def drive_servo(target, force=False):
     global smoothed_pan, last_sent
-    smoothed_pan = smoothed_pan * 0.8 + target * 0.2
+    smoothed_pan = target if force else smoothed_pan * 0.8 + target * 0.2
     val = int(smoothed_pan)
-    if ser and abs(val - last_sent) >= 2:
+    if ser and (force or abs(val - last_sent) >= 2):
         try: ser.write(f"{val},90\n".encode())
         except Exception: pass
         last_sent = val
 
+locked_center = None
+lost_streak = 0
+LOST_RESET_FRAMES = 15  # ~0.5s of nothing before we allow snapping to a new face
+
+def pick_face(faces):
+    """Stay locked on the previously-tracked face instead of re-picking the
+    biggest one every frame, so a person walking into the background doesn't
+    steal the camera."""
+    global locked_center, lost_streak
+    if not len(faces):
+        lost_streak += 1
+        if lost_streak > LOST_RESET_FRAMES:
+            locked_center = None
+        return None
+    lost_streak = 0
+    if locked_center is None:
+        face = max(faces, key=lambda f: f[2] * f[3])
+    else:
+        lx, ly = locked_center
+        face = min(faces, key=lambda f: (f[0] + f[2] / 2 - lx) ** 2 + (f[1] + f[3] / 2 - ly) ** 2)
+    x, y, fw, fh = face
+    locked_center = (x + fw / 2, y + fh / 2)
+    return face
+
+manual_pan = 90
+last_manual_ts = 0.0
+MANUAL_STEP = 8
+MANUAL_HOLD_S = 1.5  # after a manual key, auto-tracking backs off briefly
+
+def manual_active(now):
+    return (now - last_manual_ts) < MANUAL_HOLD_S
+
 def camera_loop():
-    global latest_frame
+    global latest_frame, manual_pan, last_manual_ts
     cam = cv2.VideoCapture(CAM_INDEX)
     face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     while True:
@@ -56,15 +88,32 @@ def camera_loop():
                 positivity.bus.publish(frame, faces)
             except Exception:
                 pass
-        if len(faces):
-            x, y, fw, fh = max(faces, key=lambda f: f[2]*f[3])
-            memory.identifier.submit(frame, (x, y, fw, fh))
-            drive_servo(pan_for((x, y, fw, fh), w))
+        target = pick_face(faces)
+        if target is not None:
+            memory.identifier.submit(frame, target)
+            if not manual_active(time.time()):
+                drive_servo(pan_for(target, w))
+            x, y, fw, fh = target
             cv2.rectangle(frame, (x, y), (x+fw, y+fh), (0,255,0), 2)
         else:
             memory.identifier.submit(frame, None)
+        cv2.putText(frame, "A/D pan  C center  ESC quit", (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.imshow("JARVIS (ESC quit)", frame)
-        if cv2.waitKey(1) == 27:
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('a'), ord('A')):
+            manual_pan = max(20, manual_pan - MANUAL_STEP)
+            last_manual_ts = time.time()
+            drive_servo(manual_pan, force=True)
+        elif key in (ord('d'), ord('D')):
+            manual_pan = min(160, manual_pan + MANUAL_STEP)
+            last_manual_ts = time.time()
+            drive_servo(manual_pan, force=True)
+        elif key in (ord('c'), ord('C')):
+            manual_pan = 90
+            last_manual_ts = time.time()
+            drive_servo(manual_pan, force=True)
+        elif key == 27:
             close_and_exit(lambda: (positivity.close(), memory.close()))
 
 def look(parameters):

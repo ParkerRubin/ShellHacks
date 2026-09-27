@@ -117,6 +117,8 @@ def test_robot_tools_callbacks_and_look_hook(monkeypatch, enabled, positivity_en
         COLOR_BGR2GRAY=1,
         cvtColor=lambda frame, mode: frame,
         rectangle=lambda *a: None,
+        putText=lambda *a, **k: None,
+        FONT_HERSHEY_SIMPLEX=0,
         imshow=lambda *a: None,
         waitKey=lambda n: 0,
     )
