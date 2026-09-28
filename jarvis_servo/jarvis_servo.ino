@@ -12,25 +12,29 @@ const int TILT_PIN = 10;
 const int PAN_MIN  = 20,  PAN_MAX  = 160;   // keep in sync with jarvis.py limits
 const int TILT_MIN = 45,  TILT_MAX = 135;
 
-// Eased glide: covers 25% of the remaining distance each tick, capped at MAX_STEP.
-// Big moves are fast, and it slows down as it lands so it doesn't overshoot or wobble.
-// jarvis.py mirrors these three numbers to estimate where the head is mid-move, so keep them in sync.
-const float EASE           = 0.25;
-const float MAX_STEP       = 4.0;   // degrees per tick (~265 deg/s top speed)
+// Smooth glide: speeds up gently (ACCEL), cruises at up to MAX_STEP, and eases in as it lands (EASE).
+// Lower numbers = slower, smoother turns. jarvis.py mirrors these four numbers to know where the head
+// is mid-turn, so if you change them here, change them in jarvis.py (class Servo) too.
+const float EASE           = 0.12;  // share of the remaining distance per tick
+const float MAX_STEP       = 2.0;   // degrees per tick (~130 deg/s top speed)
+const float ACCEL          = 0.25;  // how fast it can speed up or slow down, degrees per tick per tick
 const unsigned long TICK_MS = 15;   // update rate (~66 Hz)
 
 Servo pan, tilt;
 float panPos = 90, tiltPos = 90;
+float panVel = 0, tiltVel = 0;
 int panTarget = 90, tiltTarget = 90;
 unsigned long lastTick = 0;
 
 char buf[24];
 byte len = 0;
 
-float glide(float pos, int target) {
+float glide(float pos, int target, float &vel) {
   float d = target - pos;
-  if (fabs(d) <= 0.5) return target;         // close enough: land exactly
-  return pos + constrain(d * EASE, -MAX_STEP, MAX_STEP);
+  if (fabs(d) <= 0.5 && fabs(vel) <= ACCEL) { vel = 0; return target; }   // close enough: land exactly
+  float want = constrain(d * EASE, -MAX_STEP, MAX_STEP);                   // speed we'd like right now
+  vel += constrain(want - vel, -ACCEL, ACCEL);                             // ramp toward it, no lurches
+  return pos + vel;
 }
 
 void handleLine(char *s) {
@@ -82,8 +86,8 @@ void loop() {
   // glide toward the target
   if (millis() - lastTick >= TICK_MS) {
     lastTick = millis();
-    panPos  = glide(panPos,  panTarget);
-    tiltPos = glide(tiltPos, tiltTarget);
+    panPos  = glide(panPos,  panTarget,  panVel);
+    tiltPos = glide(tiltPos, tiltTarget, tiltVel);
     pan.write((int)(panPos + 0.5));
     tilt.write((int)(tiltPos + 0.5));
   }

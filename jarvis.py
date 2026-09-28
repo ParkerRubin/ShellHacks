@@ -24,10 +24,6 @@ from dotenv import load_dotenv
 from elevenlabs import ElevenLabs
 from elevenlabs.conversational_ai.conversation import Conversation, ClientTools
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
-# The jarvis/ package (memory, positivity) sits next to this script; `import jarvis` resolves to it.
-from jarvis.memory import NullMemory, build_memory
-from jarvis.positivity import NullPositivity, build_positivity
-from jarvis.runtime import close_and_exit
 
 # ------------------------------------------------------------------ config
 load_dotenv()
@@ -118,8 +114,6 @@ class State:
 
 S = State()
 convo = None
-MEMORY = NullMemory()          # replaced in main(): face recognition + conversation memory (needs ENCRYPTION_KEY)
-POSITIVITY = NullPositivity()  # replaced in main(): opt-in encouragement (POSITIVITY_ENABLED=true)
 
 def set_status(msg, secs=3.0, log=True):
     S.status, S.status_until = msg, time.time() + secs
@@ -260,20 +254,7 @@ def look(p):
     prompt += f"Question: {q}" if q else "Describe what is in front of the camera, focusing on the main subject."
     ans = gemini(prompt, frame) or "I couldn't make that out clearly."
     add_log("look", text=ans, question=q or "What do you see?")
-    MEMORY.ingestor.on_gemini(ans)
     return ans
-
-@tool
-def recall(p):
-    return MEMORY.retriever.recall(arg(p, "query", ""), MEMORY.presence.user_id) or "Nothing relevant remembered yet."
-
-@tool
-def remember_me(p):
-    return MEMORY.consent.remember(arg(p, "confirmed", False), arg(p, "name"))   # only a real True counts as consent
-
-@tool
-def forget_me(p):
-    return MEMORY.consent.forget()
 
 @tool
 def take_photo(p):
@@ -779,7 +760,8 @@ class Servo:
     vel = (0.0, 0.0); prev_world = None; prev_t = 0.0                 # your angular velocity, for leading
     est_hist = deque(maxlen=60)                                        # (time, est_pan, est_tilt) for latency compensation
     manual_until = 0.0     # after a turn_camera command, tracking waits so it doesn't fight you
-    EASE, MAX_STEP, TICK = 0.25, 4.0, 0.015                            # must match jarvis_servo.ino
+    EASE, MAX_STEP, ACCEL, TICK = 0.12, 2.0, 0.25, 0.015              # must match jarvis_servo.ino
+    est_vel = [0.0, 0.0]
     calib = None           # None = directions not confirmed yet; "done" once measured (or loaded / set in .env)
     probe = None           # (axis, phase, t0, e0, base) while a calibration nudge is running
     DIRS_FILE = BASE / "models" / "servo_dirs.json"                     # measured directions, reused next run
@@ -792,8 +774,11 @@ class Servo:
         try:
             d = json.loads(cls.DIRS_FILE.read_text()); PAN_DIR, TILT_DIR = int(d["pan"]), int(d["tilt"])
             cls.lat = cls.lat_measured = float(d.get("latency", CAM_LATENCY)) if not os.getenv("CAM_LATENCY") else CAM_LATENCY
-            cls.calib = "done" if ("latency" in d or os.getenv("CAM_LATENCY")) else None   # older file: re-measure lag once
-            print(f"Servo calibration loaded: pan {PAN_DIR:+d}, camera lag {cls.lat * 1000:.0f} ms. Press K to recalibrate.")
+            same_glide = d.get("glide") == cls.glide_id()
+            cls.calib = "done" if ((same_glide and "latency" in d) or os.getenv("CAM_LATENCY")) else None
+            if cls.calib is None: print("Servo motion settings changed since the last calibration: re-measuring once.")
+            if cls.calib == "done":
+                print(f"Servo calibration loaded: pan {PAN_DIR:+d}, camera lag {cls.lat * 1000:.0f} ms. Press K to recalibrate.")
         except Exception:
             print("Servo directions not calibrated yet: I'll nudge the head once when I first see you.")
 
@@ -817,12 +802,12 @@ class Servo:
         if phase == "settle":                                           # stand still briefly, record where you are
             cls.pan, cls.tilt = base
             if now - t0 > 0.3:
-                cls.probe = (axis, "move", now, e, base); cls.probe_seen = None
+                cls.probe = (axis, "move", now, e, base); cls.probe_trace = []
                 if axis == "pan": cls.pan = base[0] + 8
                 else: cls.tilt = base[1] + 8
-        elif phase == "move" and cls.probe_seen is None and abs(e - e0) > 0.5 * 8 / CAM_HFOV:
-            cls.probe_seen = now                                        # first frame showing the nudge = camera lag
-        if phase == "move" and now - t0 > 0.9:                          # glide done and fresh frames are in
+        elif phase == "move":
+            cls.probe_trace.append((now, e))                            # watch the nudge arrive in the image
+        if phase == "move" and now - t0 > 1.2:                          # glide done and fresh frames are in
             d = e - e0
             if not 0.05 < abs(d) < 0.3:                                 # too small: servo didn't turn. too big: you moved
                 cls.probe = None; cls.pan, cls.tilt = base; cls.calib_retry = now + 3
@@ -841,9 +826,11 @@ class Servo:
             else:
                 ok = (d < 0) == (TILT_DIR > 0)                          # model: +tilt shifts you up in the image when TILT_DIR=+1
                 if not ok: TILT_DIR = -TILT_DIR
-            if axis == "pan" and cls.probe_seen and not os.getenv("CAM_LATENCY"):
-                fp = 1.0 / max(10.0, S.fps)                                  # glide needs ~35 ms to show, plus frame timing
-                cls.lat = cls.lat_measured = min(0.45, max(0.03, cls.probe_seen - t0 - 0.035 - 2 * fp))
+            if axis == "pan" and not os.getenv("CAM_LATENCY"):
+                L = cls.fit_lag(cls.probe_trace, t0, e0, e)
+                if L is not None:                                       # the fit includes one frame of arrival time
+                    L -= 1.0 / max(10.0, S.fps)
+                    cls.lat = cls.lat_measured = min(0.45, max(0.03, L))
             print(f"[calibration] {axis}: image shift {d:+.3f} -> direction {'OK' if ok else 'was backwards, flipped'}, "
                   f"camera lag {cls.lat * 1000:.0f} ms")
             cls.pan, cls.tilt = base
@@ -858,18 +845,21 @@ class Servo:
     calib_fails = 0
     last_seen = (-99.0, 0.0, 90.0)                                     # (time, image offset, world angle) when last seen
     lat = CAM_LATENCY                                                  # camera lag, measured during calibration
-    probe_seen = None
+    probe_trace = []
     osc = deque(maxlen=150); osc_cool = 0.0                            # recent (time, pan command) for wobble detection
     lat_measured = CAM_LATENCY
 
     @classmethod
     def save_calib(cls):
-        try: cls.DIRS_FILE.write_text(json.dumps({"pan": PAN_DIR, "tilt": TILT_DIR, "latency": round(cls.lat, 3)}))
+        try: cls.DIRS_FILE.write_text(json.dumps({"pan": PAN_DIR, "tilt": TILT_DIR, "latency": round(cls.lat, 3),
+                                                   "glide": cls.glide_id()}))
         except Exception: pass
 
     @classmethod
     def check_wobble(cls, now):
-        """Backup for a wrong lag estimate: if the head keeps swinging back and forth, assume more lag."""
+        """Backup for a wrong lag estimate: if the head keeps swinging back and forth, assume more lag.
+        Off by default (calibration measures the lag); WOBBLE_GUARD=1 in .env turns it on."""
+        if os.getenv("WOBBLE_GUARD", "0") != "1": return
         cls.osc.append((now, cls.pan))
         if now < cls.osc_cool: return
         recent = [p for t, p in cls.osc if now - t < 3.0]
@@ -952,11 +942,53 @@ class Servo:
         ticks = min(40, int((now - cls.est_t) / cls.TICK))
         cls.est_t += ticks * cls.TICK
         for _ in range(ticks):
-            for attr, cmd in (("est_pan", float(cls.sent[0] or 90)), ("est_tilt", float(cls.sent[1] or 90))):
-                d = cmd - getattr(cls, attr)
-                step = max(-cls.MAX_STEP, min(cls.MAX_STEP, d * cls.EASE)) if abs(d) > 0.5 else d
-                setattr(cls, attr, getattr(cls, attr) + step)
+            for i, (attr, cmd) in enumerate((("est_pan", float(cls.sent[0] or 90)), ("est_tilt", float(cls.sent[1] or 90)))):
+                setattr(cls, attr, cls.glide_step(getattr(cls, attr), cmd, i))
         cls.est_hist.append((now, cls.est_pan, cls.est_tilt))
+
+    @classmethod
+    def glide_step(cls, pos, target, i):
+        """One Arduino tick of the glide (same math as glide() in jarvis_servo.ino)."""
+        d = target - pos
+        v = cls.est_vel[i]
+        if abs(d) <= 0.5 and abs(v) <= cls.ACCEL:
+            cls.est_vel[i] = 0.0; return target
+        want = max(-cls.MAX_STEP, min(cls.MAX_STEP, d * cls.EASE))
+        v += max(-cls.ACCEL, min(cls.ACCEL, want - v))
+        cls.est_vel[i] = v
+        return pos + v
+
+    @classmethod
+    def glide_id(cls):
+        return f"{cls.EASE}/{cls.MAX_STEP}/{cls.ACCEL}"
+
+    @classmethod
+    def glide_curve(cls, deg=8.0, secs=1.5):
+        """Head position over time for a nudge of `deg` degrees (same math as the Arduino)."""
+        pos, v, out = 0.0, 0.0, []
+        for _ in range(int(secs / cls.TICK)):
+            d = deg - pos
+            if abs(d) <= 0.5 and abs(v) <= cls.ACCEL: pos, v = deg, 0.0
+            else:
+                want = max(-cls.MAX_STEP, min(cls.MAX_STEP, d * cls.EASE)); v += max(-cls.ACCEL, min(cls.ACCEL, want - v)); pos += v
+            out.append(pos)
+        return out
+
+    @classmethod
+    def fit_lag(cls, trace, t0, e0, e_final):
+        """Find the camera lag that best lines up what the camera saw with how the head actually moved."""
+        curve = cls.glide_curve()
+        span = e_final - e0
+        if abs(span) < 1e-6 or len(trace) < 5: return None
+        def frac_at(tau):
+            if tau <= 0: return 0.0
+            i = min(len(curve) - 1, int(tau / cls.TICK)); return curve[i] / 8.0
+        best, best_err = None, 1e9
+        for ms in range(0, 451, 5):
+            L = ms / 1000.0
+            err = sum(((e - e0) / span - frac_at(t - t0 - L)) ** 2 for t, e in trace)
+            if err < best_err: best, best_err = L, err
+        return best
 
     @classmethod
     def _pose_at(cls, t):
@@ -1611,7 +1643,6 @@ def camera_loop():
             S.faces = detect_faces(frame)
             update_target(S.faces, now, frame)
             update_object(frame)
-            feed_memory_and_positivity(frame, now)
         S.target = Obj.box if Obj.box is not None else S.face_target
         S.aim = _center(Obj.box) if Obj.box is not None else (S.target_eyes if S.face_target is not None else None)
         Servo.track(now)
@@ -1634,20 +1665,6 @@ def camera_loop():
         if S.close_hits >= 5:
             print("Window closed."); shutdown()
 
-def _px(frame, b):
-    h, w = frame.shape[:2]
-    return (int(b[0] * w), int(b[1] * h), int(b[2] * w), int(b[3] * h))
-
-def feed_memory_and_positivity(frame, now):
-    """Hand this frame to the memory face identifier and the positivity bus (both take pixel boxes)."""
-    if POSITIVITY.enabled:
-        try: POSITIVITY.bus.publish(frame, [_px(frame, b) for b in S.faces])
-        except Exception: pass
-    if MEMORY.enabled:
-        seen = S.face_target is not None and S.last_face_t == now   # the locked person was actually seen this frame
-        try: MEMORY.identifier.submit(frame, _px(frame, S.face_target) if seen else None)
-        except Exception: pass
-
 def shutdown():
     if S.quit: return
     S.quit = True
@@ -1656,7 +1673,7 @@ def shutdown():
     except Exception: pass
     try: convo and convo.end_session()
     except Exception: pass
-    close_and_exit(lambda: (POSITIVITY.close(), MEMORY.close()))   # bounded, so a stuck DB can't hang ESC
+    os._exit(0)
 
 # ------------------------------------------------------------------ voice session
 class SmartAudio(DefaultAudioInterface):
@@ -1683,45 +1700,14 @@ def build_client_tools():
     for name, fn in TOOLS.items(): ct.register(name, fn)
     return ct
 
-def on_agent(t):
-    print("JARVIS:", t); S.cap_agent = (t, time.time())
-    MEMORY.ingestor.on_agent(t)
-
-def on_user(t):
-    deliver = True
-    if POSITIVITY.enabled:
-        try: deliver = POSITIVITY.on_user_transcript(t)   # False = an opt-out phrase, kept out of memory and logs
-        except Exception: pass
-    S.last_user_t = time.time()
-    if not deliver: return
-    print("You:", t); S.cap_user = (t, time.time())
-    MEMORY.ingestor.on_user(t)
-
-def start_memory_and_positivity():
-    global MEMORY, POSITIVITY
-    # The memory config uses relative paths; pin them to this folder so it works from any working directory.
-    os.environ.setdefault("LOCAL_FALLBACK_PATH", str(BASE / "data" / "fallback.sqlite3"))
-    os.environ.setdefault("FACE_DETECTION_MODEL", str(MODELS / "face_detection_yunet_2023mar.onnx"))
-    os.environ.setdefault("FACE_RECOGNITION_MODEL", str(MODELS / "face_recognition_sface_2021dec.onnx"))
-    if os.getenv("MEMORY_ENABLED", "true").lower() != "false" and not os.getenv("ENCRYPTION_KEY"):
-        print("Memory: off (add ENCRYPTION_KEY to .env to turn it on: python scripts/gen_key.py)")
-    else:
-        if os.getenv("MEMORY_ENABLED", "true").lower() != "false":
-            try:
-                zoo_model("face_detection_yunet", "face_detection_yunet_2023mar.onnx")
-                zoo_model("face_recognition_sface", "face_recognition_sface_2021dec.onnx")
-            except Exception as e: print(f"Memory face models unavailable: {e}")
-        MEMORY = build_memory()
-        print(f"Memory: {'on' if MEMORY.enabled else 'off'}")
-    POSITIVITY = build_positivity(client, GEMINI, VISION_MODEL)
-    if POSITIVITY.enabled: print("Positivity: on")
+def on_agent(t):  print("JARVIS:", t); S.cap_agent = (t, time.time())
+def on_user(t):   print("You:", t);    S.cap_user = (t, time.time()); S.last_user_t = time.time()
 
 def main():
     global convo
     check_models()
     load_face_model()
     load_hand_models()
-    start_memory_and_positivity()
     Servo.load_dirs()
     Servo.connect()
     threading.Thread(target=camera_loop, daemon=True).start()
