@@ -241,41 +241,5 @@
     "required": [
       "target"
     ]
-  },
-  {
-    "name": "recall",
-    "description": "Return relevant consented history for the person currently recognized. Call when they ask about an earlier conversation, or at the start of a conversation for known profile facts. An empty response means no memory is available: continue normally and never invent a memory or a name.",
-    "parameters": {
-      "query": {
-        "type": "string",
-        "description": "A concise search query, e.g. 'what we talked about yesterday'."
-      }
-    },
-    "required": [
-      "query"
-    ]
-  },
-  {
-    "name": "remember_me",
-    "description": "Enroll the visible person so JARVIS recognizes them next time (encrypted conversation history plus a locally computed face signature). Only call after they explicitly said yes to being remembered. Never infer confirmation.",
-    "parameters": {
-      "confirmed": {
-        "type": "boolean",
-        "description": "True only after an explicit spoken yes."
-      },
-      "name": {
-        "type": "string",
-        "description": "Optional display name, only if they gave one."
-      }
-    },
-    "required": [
-      "confirmed"
-    ]
-  },
-  {
-    "name": "forget_me",
-    "description": "Delete the currently recognized person's saved profile and history. Read the result accurately; if remote deletion is queued, say so.",
-    "parameters": {},
-    "required": []
   }
 ]
